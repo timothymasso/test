@@ -16,6 +16,14 @@ from .analysis import Assessment, Settings, assess
 
 SKIP_LINUX_ROOTS = {"/proc", "/sys", "/dev", "/run"}
 
+# Windows file attributes
+REPARSE_POINT = 0x400  # junctions and other links (is_junction() only exists on Python 3.12+)
+ONLINE_ONLY = 0x400000 | 0x40000 | 0x1000  # OneDrive/cloud placeholders: reading them downloads them
+
+# Folder names that hold a program's DLLs one or two levels below its real install folder.
+BIN_DIRS = {"bin", "bin32", "bin64", "x64", "x86", "win64", "win32", "binaries", "lib", "plugins"}
+USER_FOLDERS = {"downloads", "desktop", "documents", "pictures", "videos", "music", "movies"}
+
 
 @dataclass
 class FileEntry:
@@ -25,6 +33,7 @@ class FileEntry:
     atime: float
     assessment: Assessment
     duplicate_of: str | None = None
+    online_only: bool = False
 
     @property
     def name(self) -> str:
@@ -88,10 +97,12 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
         with it:
             for entry in it:
                 try:
-                    if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
+                    if entry.is_symlink():
                         continue
                     if entry.is_dir(follow_symlinks=False):
-                        stack.append(entry.path)
+                        attrs = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+                        if not attrs & REPARSE_POINT:
+                            stack.append(entry.path)
                         continue
                     if not entry.is_file(follow_symlinks=False):
                         continue
@@ -103,7 +114,13 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
                     continue
                 size = st.st_size
                 a = assess(entry.path, size, st.st_mtime, st.st_atime, settings, now)
-                result.files.append(FileEntry(entry.path, size, st.st_mtime, st.st_atime, a))
+                f = FileEntry(entry.path, size, st.st_mtime, st.st_atime, a)
+                if getattr(st, "st_file_attributes", 0) & ONLINE_ONLY:
+                    f.online_only = True
+                    a.verdict = kb.KEEP
+                    a.reason = ("Online-only cloud file: it's listed here but stored in the cloud, so it "
+                                "takes (almost) no space on this drive.")
+                result.files.append(f)
                 local_bytes += size
                 local_count += 1
         seen_bytes += local_bytes
@@ -125,14 +142,56 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
 
     result.folder_sizes = dict(folder_sizes)
     result.folder_counts = dict(folder_counts)
+    protect_program_folders(result.files, root)
 
     if find_duplicates and not result.cancelled:
         if progress:
             progress(len(result.files), seen_bytes, "Looking for duplicate files...")
         mark_duplicates(result.files, cancel)
+        result.cancelled = cancel.is_set()
 
     result.seconds = time.time() - start
     return result
+
+
+# ---------------------------------------------------------------------------
+# Installed programs outside the well-known folders (games on D:, portable apps)
+# ---------------------------------------------------------------------------
+
+def protect_program_folders(files: list[FileEntry], scan_root: str) -> int:
+    """A folder that holds DLLs is an installed program: nothing under its install folder
+    should be suggested for deleting or moving by hand. Returns the number of files changed."""
+    roots = set()
+    for f in files:
+        if f.path.lower().endswith(".dll"):
+            d = os.path.dirname(f.path)
+            while os.path.basename(d).lower() in BIN_DIRS and os.path.dirname(d) != d:
+                d = os.path.dirname(d)
+            if d != scan_root and os.path.dirname(d) != d and os.path.basename(d).lower() not in USER_FOLDERS:
+                roots.add(os.path.join(d, ""))
+    if not roots:
+        return 0
+    changed = 0
+    for f in files:
+        a = f.assessment
+        if a.verdict in (kb.KEEP, kb.SYSTEM):
+            continue
+        # explicit temp/trash folders stay deletable even if an installer unpacked DLLs there
+        if a.location and a.location.verdict == kb.DELETE and a.location.fragment not in kb.GENERIC_CACHE_FRAGMENTS:
+            continue
+        d = os.path.dirname(f.path)
+        while True:
+            if os.path.join(d, "") in roots:
+                a.verdict, a.protected = kb.KEEP, True
+                a.reason = (f"Part of a program installed in {d}. Uninstall the program, or use its own "
+                            "'move' option, instead of deleting or moving its files by hand.")
+                changed += 1
+                break
+            parent = os.path.dirname(d)
+            if parent == d or len(parent) < len(scan_root):
+                break
+            d = parent
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +225,9 @@ def mark_duplicates(files: list[FileEntry], cancel: threading.Event | None = Non
     """
     by_size: dict[int, list[FileEntry]] = defaultdict(list)
     for f in files:
-        if f.size >= min_size and f.verdict not in (kb.SYSTEM, kb.DELETE):
+        # only personal files: identical DLLs in two games are both needed
+        if (f.size >= min_size and f.verdict in (kb.KEEP, kb.MOVE) and not f.online_only
+                and f.assessment.kind in kb.PERSONAL_KINDS and not f.assessment.protected):
             by_size[f.size].append(f)
 
     marked = 0
@@ -176,7 +237,7 @@ def mark_duplicates(files: list[FileEntry], cancel: threading.Event | None = Non
         if cancel and cancel.is_set():
             break
         by_head: dict[str, list[FileEntry]] = defaultdict(list)
-        for f in group:
+        for f in _drop_hard_links(group):
             h = _hash(f.path, 64 * 1024)
             if h:
                 by_head[h].append(f)
@@ -185,7 +246,7 @@ def mark_duplicates(files: list[FileEntry], cancel: threading.Event | None = Non
                 continue
             by_full: dict[str, list[FileEntry]] = defaultdict(list)
             for f in head_group:
-                h = _hash(f.path) if size > 64 * 1024 else "same"
+                h = _hash(f.path)
                 if h:
                     by_full[h].append(f)
             for dupes in by_full.values():
@@ -202,3 +263,18 @@ def mark_duplicates(files: list[FileEntry], cancel: threading.Event | None = Non
                                     "You only need one copy.")
                     marked += 1
     return marked
+
+
+def _drop_hard_links(group: list[FileEntry]) -> list[FileEntry]:
+    """Hard links are one file with two names; deleting one frees nothing."""
+    seen, out = set(), []
+    for f in group:
+        try:
+            st = os.stat(f.path)  # DirEntry.stat() has no inode number on Windows
+            key = (st.st_dev, st.st_ino) if st.st_ino else f.path
+        except OSError:
+            continue
+        if key not in seen:
+            seen.add(key)
+            out.append(f)
+    return out

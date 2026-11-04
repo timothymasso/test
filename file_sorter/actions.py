@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -23,6 +24,7 @@ class ActionReport:
     done: list[tuple[str, str]] = field(default_factory=list)   # (source, destination or "")
     failed: list[tuple[str, str]] = field(default_factory=list)  # (source, error)
     bytes: int = 0
+    log_error: str | None = None
 
 
 def recycle_bin_available() -> bool:
@@ -43,10 +45,19 @@ def destination_for(path: str, scan_root: str, dest_root: str) -> str:
     return os.path.join(dest_root, base, rel)
 
 
-def move_files(paths: list[str], scan_root: str, dest_root: str) -> ActionReport:
+def move_files(paths: list[str], scan_root: str, dest_root: str,
+               progress=None) -> ActionReport:
+    """Copy each file to dest (keeping folders), check it, then remove the original.
+
+    Nothing is ever lost: a failed copy is cleaned up and the original stays put.
+    Each finished move is logged right away in dest_root/LOG_NAME.
+    """
     report = ActionReport()
-    log_rows = []
-    for src in paths:
+    log_path = os.path.join(dest_root, LOG_NAME)
+    for i, src in enumerate(paths):
+        if progress:
+            progress(i, len(paths), src)
+        dst = tmp = None
         try:
             dst = destination_for(src, scan_root, dest_root)
             if os.path.exists(dst):
@@ -54,29 +65,54 @@ def move_files(paths: list[str], scan_root: str, dest_root: str) -> ActionReport
                 dst = f"{stem} (moved {time.strftime('%Y%m%d-%H%M%S')}){ext}"
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             size = os.path.getsize(src)
-            # copy first, verify, then remove the original (safe across drives)
-            shutil.copy2(src, dst)
-            if os.path.getsize(dst) != size:
-                os.remove(dst)
-                raise OSError("copy was incomplete; original left in place")
-            os.remove(src)
-            report.done.append((src, dst))
-            report.bytes += size
-            log_rows.append([time.strftime("%Y-%m-%d %H:%M:%S"), src, dst, size])
+            tmp = dst + ".partial"
+            shutil.copy2(src, tmp)
+            if os.path.getsize(tmp) != size:
+                raise OSError("the copy came out incomplete")
+            os.replace(tmp, dst)
+            tmp = None
+            try:
+                os.remove(src)
+            except PermissionError:
+                os.chmod(src, stat.S_IWRITE)  # read-only files (camera/CD imports) refuse removal on Windows
+                os.remove(src)
         except Exception as e:  # noqa: BLE001 - report every failure to the user
-            report.failed.append((src, str(e)))
-    if log_rows:
-        log_path = os.path.join(dest_root, LOG_NAME)
-        new = not os.path.exists(log_path)
+            for leftover in (tmp, dst if dst and os.path.exists(src) and os.path.exists(dst) else None):
+                if leftover:
+                    try:
+                        os.remove(leftover)
+                    except OSError:
+                        pass
+            report.failed.append((src, f"{e} (the original was left where it was)"))
+            continue
+        report.done.append((src, dst))
+        report.bytes += size
         try:
-            with open(log_path, "a", newline="", encoding="utf-8") as f:
+            new = not os.path.exists(log_path)
+            with open(log_path, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
                 w = csv.writer(f)
                 if new:
                     w.writerow(["when", "original location", "new location", "bytes"])
-                w.writerows(log_rows)
-        except OSError:
-            pass
+                w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), src, dst, size])
+        except OSError as e:
+            report.log_error = str(e)
     return report
+
+
+def recycle_bin_works_for(path: str) -> bool:
+    """False for places where 'send to Recycle Bin' silently deletes for good."""
+    if _send2trash is None:
+        return False
+    if sys.platform != "win32":
+        return True
+    if path.startswith("\\\\"):  # network share
+        return False
+    try:
+        import ctypes
+        kind = ctypes.windll.kernel32.GetDriveTypeW(os.path.splitdrive(os.path.abspath(path))[0] + "\\")
+        return kind not in (2, 4)  # removable, network
+    except Exception:
+        return True
 
 
 def delete_files(paths: list[str], permanently: bool = False) -> ActionReport:

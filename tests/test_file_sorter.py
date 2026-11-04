@@ -48,6 +48,24 @@ def a(path, size=1000, mtime=NOW, atime=None):
     ("/home/me/project/node_modules/react/index.js", kb.REVIEW),
     ("/home/me/project/.git/objects/ab/cdef", kb.SYSTEM),
     ("/home/me/project/src/__pycache__/x.cpython-312.pyc", kb.DELETE),
+    # review findings: real game/program/personal files must never be "safe to delete"
+    ("D:\\SteamLibrary\\steamapps\\common\\The Witcher 3\\content\\content0\\texture.cache", kb.KEEP),
+    ("D:\\SteamLibrary\\steamapps\\common\\Game\\cache\\shaders.dat", kb.KEEP),
+    ("C:\\Users\\me\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\django\\core\\cache\\db.py", kb.SYSTEM),
+    ("C:\\Users\\me\\Documents\\Cache\\thesis.docx", kb.REVIEW),
+    ("C:\\Users\\me\\OneDrive\\Pictures\\Caches\\wedding.jpg", kb.REVIEW),
+    ("D:\\Temp\\family_photos\\img001.jpg", kb.REVIEW),
+    ("C:\\Users\\me\\AppData\\Local\\Programs\\Microsoft VS Code\\resources\\app\\node_modules\\x\\rg.exe", kb.SYSTEM),
+    ("C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\typescript\\lib\\tsc.js", kb.SYSTEM),
+    ("C:\\Users\\me\\.vscode\\extensions\\ms-python\\node_modules\\a\\index.js", kb.SYSTEM),
+    ("C:\\Program Files\\SomeApp\\data\\index.dat", kb.SYSTEM),
+    ("C:\\Users\\me\\VirtualBox VMs\\Win11\\Win11.vdi", kb.KEEP),
+    ("C:\\Users\\me\\Documents\\Outlook Files\\me.pst", kb.KEEP),
+    ("C:\\Users\\me\\.android\\avd\\Pixel.avd\\userdata-qemu.img", kb.SYSTEM),
+    ("C:\\Users\\me\\anaconda3\\Lib\\site-packages\\torch\\lib\\torch_cuda.pyd", kb.SYSTEM),
+    ("/home/me/.config/google-chrome/Default/Local Storage/leveldb/000003.log", kb.SYSTEM),
+    ("/home/me/.config/google-chrome/Default/Cache/Cache_Data/f_0001", kb.DELETE),
+    ("C:\\Users\\me\\code\\.notes.swp", kb.REVIEW),
 ])
 def test_verdicts(path, verdict):
     assert a(path, mtime=OLD).verdict == verdict, a(path, mtime=OLD).reason
@@ -78,6 +96,13 @@ def test_partial_download_in_progress_is_not_deleted():
 def test_program_files_are_never_suggested_for_moving():
     r = a("D:\\Tools\\bigtool.exe", size=4 * 1024 * MB, mtime=OLD)
     assert r.verdict == kb.KEEP
+
+
+def test_big_files_in_unknown_folders():
+    # a big game data file outside known folders is not moved blindly when its kind is game data
+    assert a("D:\\Games\\X\\data.pak", size=4 * 1024 * MB, mtime=OLD).verdict == kb.KEEP
+    # a big unknown file is still a move candidate
+    assert a("D:\\stuff\\dump.raw", size=4 * 1024 * MB).verdict == kb.MOVE
 
 
 def test_steam_game_kept_with_move_advice():
@@ -133,8 +158,9 @@ def _build_tree(tmp_path):
     (tmp_path / "Videos" / "a.mp4").write_bytes(os.urandom(2 * MB))
     (tmp_path / "Videos" / "copy of a.mp4").write_bytes((tmp_path / "Videos" / "a.mp4").read_bytes())
     os.utime(tmp_path / "Videos" / "a.mp4", (OLD, OLD))
-    (tmp_path / "cache").mkdir()
-    (tmp_path / "cache" / "blob").write_bytes(b"x" * 100)
+    cache = tmp_path / "AppData" / "Local" / "SomeApp" / "Cache"
+    cache.mkdir(parents=True)
+    (cache / "blob").write_bytes(b"x" * 100)
     (tmp_path / "notes.txt").write_text("hello\nworld\n")
     (tmp_path / "mystery").write_bytes(b"%PDF-1.7 rest of pdf")
     (tmp_path / "empty.txt").write_bytes(b"")
@@ -147,7 +173,7 @@ def test_scan(tree):
     assert by_name["setup_x64.exe"].verdict == kb.REVIEW
     assert by_name["blob"].verdict == kb.DELETE
     assert by_name["notes.txt"].verdict == kb.KEEP
-    assert by_name["empty.txt"].verdict == kb.REVIEW
+    assert by_name["empty.txt"].verdict == kb.KEEP  # frees nothing, and may be a marker file
     # the older copy is the original, the newer one is the duplicate
     assert by_name["a.mp4"].verdict == kb.MOVE
     assert by_name["copy of a.mp4"].verdict == kb.REVIEW
@@ -223,3 +249,58 @@ def test_every_folder_rule_uses_a_known_verdict():
         assert verdict in kb.VERDICTS
     for kind, _ in kb.EXTENSIONS.values():
         assert kind in kb.KINDS
+
+
+def test_program_folders_outside_known_places_are_protected(tree):
+    game = tree / "Games" / "Cyberpunk"
+    (game / "bin" / "x64").mkdir(parents=True)
+    (game / "bin" / "x64" / "engine.dll").write_bytes(b"MZ")
+    (game / "archive").mkdir()
+    (game / "archive" / "basegame.archive").write_bytes(b"\0" * 100)
+    (game / "cache").mkdir()
+    (game / "cache" / "shaders.cache").write_bytes(b"x")
+    res = scan(str(tree), Settings(move_any_mb=0))
+    by_name = {f.name: f for f in res.files}
+    assert by_name["basegame.archive"].verdict == kb.KEEP
+    assert by_name["shaders.cache"].verdict == kb.KEEP
+    # unrelated files elsewhere are untouched
+    assert by_name["blob"].verdict == kb.DELETE
+
+
+def test_duplicates_skip_program_files_and_hard_links(tree):
+    for d in ("A", "B"):
+        (tree / "Games2" / d).mkdir(parents=True)
+        (tree / "Games2" / d / "PhysX.dll").write_bytes(b"MZ" + b"1" * (2 * MB))
+    os.link(tree / "Videos" / "a.mp4", tree / "Videos" / "hardlink.mp4")
+    res = scan(str(tree), Settings(move_media_mb=1))
+    by_name = {f.name: f for f in res.files}
+    assert not any(f.duplicate_of for f in res.files if f.name == "PhysX.dll")
+    # the hard link is the same file as a.mp4, so only the real copy is a duplicate
+    assert by_name["hardlink.mp4"].duplicate_of is None
+    assert by_name["copy of a.mp4"].duplicate_of is not None
+
+
+def test_failed_move_leaves_original_and_no_partial(tree, tmp_path_factory, monkeypatch):
+    dest = tmp_path_factory.mktemp("otherdrive")
+    src = tree / "Videos" / "a.mp4"
+    data = src.read_bytes()
+
+    def broken_copy(s, d):
+        with open(d, "wb") as f:
+            f.write(b"half")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(actions.shutil, "copy2", broken_copy)
+    report = actions.move_files([str(src)], str(tree), str(dest))
+    assert report.failed and not report.done
+    assert src.read_bytes() == data
+    leftovers = [p for p in dest.rglob("*") if p.is_file()]
+    assert leftovers == []
+
+
+def test_move_read_only_file(tree, tmp_path_factory):
+    dest = tmp_path_factory.mktemp("otherdrive")
+    src = tree / "notes.txt"
+    os.chmod(src, 0o444)
+    report = actions.move_files([str(src)], str(tree), str(dest))
+    assert report.done and not src.exists()

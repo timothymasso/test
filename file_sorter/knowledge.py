@@ -152,7 +152,7 @@ EXTENSIONS: dict[str, tuple[str, str]] = {
     ".msu": ("installer", "Windows Update package."),
     # Disk images / VMs
     ".iso": ("disk_image", "CD/DVD disk image (OS installers, old games). Large; you can re-download most of these."),
-    ".img": ("disk_image", "Raw disk image."), ".bin": ("disk_image", "Raw disk image or binary data."),
+    ".img": ("disk_image", "Raw disk image."), ".bin": ("other", "Binary data: a disk image, firmware, or a program's data file."),
     ".vhd": ("vm", "Virtual hard disk (Hyper-V / Windows backup)."), ".vhdx": ("vm", "Virtual hard disk (Hyper-V, WSL, Docker)."),
     ".vmdk": ("vm", "VMware / VirtualBox virtual disk."), ".vdi": ("vm", "VirtualBox virtual disk."),
     ".qcow2": ("vm", "QEMU/KVM virtual disk."), ".ova": ("vm", "Exported virtual machine."),
@@ -187,7 +187,7 @@ EXTENSIONS: dict[str, tuple[str, str]] = {
     ".tmp": ("temp", "Temporary file a program created while working. Usually forgotten leftovers."),
     ".temp": ("temp", "Temporary file."), ".bak": ("backup", "Backup copy made by a program before saving."),
     ".old": ("backup", "Old copy kept after an update or edit."), ".~tmp": ("temp", "Temporary file."),
-    ".swp": ("temp", "Vim editor swap file (leftover if the editor crashed)."),
+    ".swp": ("backup", "Vim editor swap file. After a crash it can hold your only copy of unsaved edits."),
     ".crdownload": ("partial_download", "Chrome download that never finished."),
     ".part": ("partial_download", "Firefox/other download that never finished."),
     ".partial": ("partial_download", "Edge/other download that never finished."),
@@ -345,6 +345,29 @@ FOLDER_RULES: list[tuple[str, str, str, str, str]] = [
     ("^/sys/", "Kernel files", "Virtual files from the Linux kernel.", SYSTEM, "Not real files."),
     ("^/dev/", "Devices", "Device files.", SYSTEM, "Not real files."),
     ("^/library/", "Library", "Shared app support files and settings (macOS).", SYSTEM, "Belongs to apps and the OS."),
+    # --- games
+    ("/steamapps/downloading/", "Steam downloads in progress", "Partially downloaded Steam updates.", REVIEW,
+     "Steam will re-download if needed."),
+    ("/steamapps/common/", "Steam game", "An installed Steam game.", KEEP,
+     "To move a game to another drive, use Steam -> Settings -> Storage -> Move. Don't drag the folder yourself."),
+    ("/epic games/", "Epic Games game", "An installed Epic Games game.", KEEP,
+     "Uninstall from the Epic launcher if you don't play it. Moving it by hand breaks the launcher."),
+    ("/xboxgames/", "Xbox / Game Pass game", "An installed Xbox app game.", KEEP,
+     "Move it with the Xbox app -> Manage -> Files -> Move."),
+    ("/gog games/", "GOG game", "An installed GOG game.", KEEP,
+     "Uninstall or move it from GOG Galaxy. Moving it by hand breaks the launcher."),
+    # --- per-user program installs and developer toolchains (above the generic cache rules)
+    ("/appdata/local/programs/", "Installed program (per-user)", "A program installed just for your account.",
+     SYSTEM, "Uninstall from Settings -> Apps instead of deleting files."),
+    ("/appdata/roaming/npm/", "Global npm tools", "Command-line tools installed with npm.", SYSTEM,
+     "Remove them with 'npm uninstall -g'."),
+    ("/anaconda3/", "Anaconda Python", "A Python installation.", SYSTEM, "Uninstall it properly or remove environments with conda."),
+    ("/miniconda3/", "Miniconda Python", "A Python installation.", SYSTEM, "Uninstall it properly or remove environments with conda."),
+    ("/scoop/", "Scoop apps", "Programs installed with Scoop.", SYSTEM, "Remove them with 'scoop uninstall'."),
+    ("/virtualbox vms/", "VirtualBox virtual machines", "Virtual computers you created in VirtualBox.", KEEP,
+     "To free space, delete or move a VM from inside VirtualBox (File -> Virtual Media Manager)."),
+    ("/hyper-v/", "Hyper-V virtual machines", "Virtual computers you created in Hyper-V.", KEEP,
+     "Delete or move them from Hyper-V Manager."),
     # --- browser and app caches
     ("/cache/", "Cache folder", "A program's cache: copies of things it downloaded or computed so it can load faster.",
      DELETE, "The program rebuilds it. Close the program first."),
@@ -374,15 +397,6 @@ FOLDER_RULES: list[tuple[str, str, str, str, str]] = [
      "Deleting it erases the project's history. Leave it alone."),
     ("/obj/debug/", "Build output", "Intermediate files from compiling a project.", DELETE, "Rebuilt on next build."),
     ("/bin/debug/", "Build output", "Debug build of a project.", REVIEW, "Rebuilt on next build."),
-    # --- games
-    ("/steamapps/downloading/", "Steam downloads in progress", "Partially downloaded Steam updates.", REVIEW,
-     "Steam will re-download if needed."),
-    ("/steamapps/common/", "Steam game", "An installed Steam game.", KEEP,
-     "To move a game to another drive, use Steam -> Settings -> Storage -> Move. Don't drag the folder yourself."),
-    ("/epic games/", "Epic Games game", "An installed Epic Games game.", KEEP,
-     "Uninstall from the Epic launcher if you don't play it. Moving it by hand breaks the launcher."),
-    ("/xboxgames/", "Xbox / Game Pass game", "An installed Xbox app game.", KEEP,
-     "Move it with the Xbox app -> Manage -> Files -> Move."),
     # --- cloud sync folders
     ("/onedrive/", "OneDrive", "Files synced with your OneDrive cloud storage.", KEEP,
      "Deleting here deletes from the cloud too. Use 'Free up space' (right-click) to keep it online-only instead."),
@@ -484,7 +498,15 @@ MAGIC = [
 ]
 
 # Kinds that are personal "bulk" files worth moving to a second drive.
-MOVABLE_KINDS = {"video", "audio", "image", "raw_photo", "archive", "disk_image", "vm",
-                 "backup", "design", "ebook", "email"}
+MOVABLE_KINDS = {"video", "audio", "image", "raw_photo", "archive", "disk_image", "backup", "design", "ebook"}
+# Personal content: never "safe to delete" just because it sits in a folder called cache/temp.
+PERSONAL_KINDS = MOVABLE_KINDS | {"document", "spreadsheet", "presentation", "text", "email"}
+
+# Generic cache folder names only mean "deletable" inside an app-data area.
+GENERIC_CACHE_FRAGMENTS = {"/cache/", "/caches/", "/cache2/", "/code cache/", "/gpucache/", "/shadercache/"}
+APP_DATA_MARKERS = ("/appdata/", "/.cache/", "/.config/", "/.local/share/", "/library/caches/",
+                    "/library/application support/")
+# Hidden (dot) folders that are not app settings.
+HIDDEN_OK = {".cache", ".trash", ".git", ".pytest_cache", ".npm", ".gradle", ".m2", ".nuget"}
 # Kinds that should never be moved by hand (they belong to installed software).
 UNMOVABLE_KINDS = {"executable", "library", "driver"}

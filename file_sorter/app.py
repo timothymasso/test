@@ -32,6 +32,9 @@ VERDICT_BG = {
     kb.SYSTEM: "#fce8e6",
 }
 ALL = "Everything"
+RUNNABLE_KINDS = {"executable", "library", "driver", "script", "installer"}
+RUNNABLE_EXTS = (".exe", ".com", ".scr", ".pif", ".bat", ".cmd", ".vbs", ".js", ".jse", ".wsf", ".ps1",
+                 ".msi", ".lnk", ".reg", ".hta", ".jar")
 
 
 def plural(n: int, word: str) -> str:
@@ -59,6 +62,7 @@ class App(tk.Tk):
         self.sort_desc = True
         self.folder_filter: str | None = None
         self.current: FileEntry | None = None
+        self.busy = False  # a move/delete is running
 
         self.path_var = tk.StringVar(value=default_scan_path())
         self.dupes_var = tk.BooleanVar(value=True)
@@ -285,6 +289,8 @@ class App(tk.Tk):
         if self.scan_thread and self.scan_thread.is_alive():
             return
         root = self.path_var.get().strip()
+        if len(root) == 2 and root[1] == ":":
+            root += os.sep
         if not os.path.isdir(root):
             messagebox.showerror("File Sorter", f"'{root}' isn't a folder I can open.")
             return
@@ -335,9 +341,14 @@ class App(tk.Tk):
                     messagebox.showerror("File Sorter", f"Scan failed: {ev[1]}")
                 elif kind == "ai":
                     self._show_ai_answer(ev[1], ev[2])
+                elif kind == "status":
+                    self.status_var.set(ev[1])
+                elif kind == "action_done":
+                    self._after_action(ev[1], ev[2])
         except queue.Empty:
             pass
-        self.after(100, self._poll)
+        finally:
+            self.after(100, self._poll)  # keep polling even if handling an event failed
 
     def _scan_stopped(self) -> None:
         self.progress.stop()
@@ -352,7 +363,7 @@ class App(tk.Tk):
         movable = totals[kb.MOVE][1]
         state = "Scan stopped early" if res.cancelled else "Scan finished"
         self.status_var.set(
-            f"{state}: {len(res.files):,} files in {res.seconds:.0f}s. "
+            f"{state}: {plural(len(res.files), 'file')} in {res.seconds:.0f}s. "
             f"You could free up to {human_size(removable)} by deleting and "
             f"{human_size(movable)} by moving." + (f"  ({res.errors:,} items couldn't be read)" if res.errors else ""))
         self.refresh_all()
@@ -510,7 +521,7 @@ class App(tk.Tk):
 
     def show_file(self, f: FileEntry) -> None:
         try:
-            sections = explain(f.path, f.assessment, f.size, f.mtime, f.atime, f.duplicate_of)
+            sections = explain(f.path, f.assessment, f.size, f.mtime, f.atime, f.duplicate_of, not f.online_only)
         except OSError as e:
             sections = [("Error", str(e))]
         chunks: list[tuple[str, str]] = [(f.name + "\n", "title")]
@@ -565,6 +576,10 @@ class App(tk.Tk):
     # ------------------------------------------------------------------ actions
     def open_selected(self) -> None:
         if self.current:
+            if self.current.assessment.kind in RUNNABLE_KINDS or self.current.name.lower().endswith(RUNNABLE_EXTS):
+                # opening a program runs it; show it in its folder instead
+                self.reveal_selected()
+                return
             try:
                 actions.open_file(self.current.path)
             except OSError as e:
@@ -578,6 +593,9 @@ class App(tk.Tk):
                 messagebox.showerror("File Sorter", str(e))
 
     def _guard_system(self, entries: list[FileEntry], action: str) -> list[FileEntry] | None:
+        if self.busy:
+            messagebox.showinfo("File Sorter", "Please wait until the current move/delete has finished.")
+            return None
         system = [f for f in entries if f.verdict == kb.SYSTEM]
         if system:
             ok = [f for f in entries if f.verdict != kb.SYSTEM]
@@ -601,21 +619,23 @@ class App(tk.Tk):
         names = "\n".join(f"  {f.name}" for f in entries[:8]) + ("\n  ..." if len(entries) > 8 else "")
         warn = (f"\n\n{len(risky):,} of these are marked '{kb.KEEP}' or '{kb.MOVE}'. Are you sure?"
                 if risky else "")
-        if actions.recycle_bin_available():
+        if all(actions.recycle_bin_works_for(f.path) for f in entries):
             if not messagebox.askyesno("Delete files",
                                        f"Send {plural(len(entries), 'file')} ({human_size(total)}) to the Recycle Bin?\n\n"
                                        f"{names}{warn}"):
                 return
-            report = actions.delete_files([f.path for f in entries])
+            permanently = False
         else:
+            why = ("Install 'send2trash' to use the Recycle Bin instead." if not actions.recycle_bin_available()
+                   else "Some of these are on a network or removable drive, which has no Recycle Bin.")
             if not messagebox.askyesno("Delete files permanently",
                                        f"PERMANENTLY delete {plural(len(entries), 'file')} ({human_size(total)})?\n"
                                        "They will NOT go to the Recycle Bin and can't be recovered.\n"
-                                       "(Install 'send2trash' to use the Recycle Bin instead.)\n\n"
-                                       f"{names}{warn}", icon="warning"):
+                                       f"({why})\n\n{names}{warn}", icon="warning"):
                 return
-            report = actions.delete_files([f.path for f in entries], permanently=True)
-        self._after_action(report, "Deleted")
+            permanently = True
+        paths = [f.path for f in entries]
+        self._run_action("Deleting", lambda progress: actions.delete_files(paths, permanently), "Deleted")
 
     def move_selected(self) -> None:
         entries = self._guard_system(self.selected_entries(), "move")
@@ -626,7 +646,11 @@ class App(tk.Tk):
             return
         dest = os.path.abspath(dest)
         root = os.path.abspath(self.result.root)
-        if os.path.commonpath([dest, root]) == root:
+        try:
+            inside = os.path.commonpath([dest, root]) == root
+        except ValueError:  # different drives on Windows: that's the point
+            inside = False
+        if inside:
             messagebox.showerror("File Sorter", "Pick a folder outside the folder you scanned "
                                                 "(ideally on your other drive).")
             return
@@ -649,19 +673,48 @@ class App(tk.Tk):
                                    f"Folders are kept, e.g.\n{example}\n\n"
                                    f"A list of everything moved is saved in {actions.LOG_NAME} there.{warn}"):
             return
-        self.config(cursor="watch")
-        self.update_idletasks()
-        try:
-            report = actions.move_files([f.path for f in entries], root, dest)
-        finally:
-            self.config(cursor="")
-        self._after_action(report, "Moved")
+        paths = [f.path for f in entries]
+        self._run_action("Moving", lambda progress: actions.move_files(paths, root, dest, progress), "Moved")
+
+    def _run_action(self, doing: str, work, verb: str) -> None:
+        """Run a move/delete off the UI thread so the window never shows 'Not Responding'."""
+        self.busy = True
+        for b in (self.btn_move, self.btn_delete, self.scan_btn):
+            b.configure(state="disabled")
+        self.progress.start(12)
+
+        def progress(i: int, n: int, path: str) -> None:
+            self.events.put(("status", f"{doing} {i + 1:,} of {n:,}: {os.path.basename(path)}"))
+
+        def run() -> None:
+            try:
+                report = work(progress)
+            except Exception as e:  # noqa: BLE001
+                report = actions.ActionReport(failed=[("", str(e))])
+            self.events.put(("action_done", report, verb))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _after_action(self, report: actions.ActionReport, verb: str) -> None:
+        self.busy = False
+        self.progress.stop()
+        self.scan_btn.configure(state="normal")
         done = {src for src, _ in report.done}
         if self.result:
+            gone = [f for f in self.result.files if f.path in done]
             self.result.files = [f for f in self.result.files if f.path not in done]
-        self.status_var.set(f"{verb} {plural(len(report.done), 'file')}, freed {human_size(report.bytes)} on this drive.")
+            for f in gone:  # keep the "Biggest folders" numbers right
+                d = os.path.dirname(f.path)
+                while d in self.result.folder_sizes:
+                    self.result.folder_sizes[d] -= f.size
+                    self.result.folder_counts[d] -= 1
+                    if os.path.dirname(d) == d:
+                        break
+                    d = os.path.dirname(d)
+        self.status_var.set(f"{verb} {plural(len(report.done), 'file')} ({human_size(report.bytes)}).")
+        if report.log_error:
+            messagebox.showwarning("File Sorter", f"The files were moved, but the list of moved files couldn't "
+                                                  f"be saved: {report.log_error}")
         if report.failed:
             lines = "\n".join(f"{os.path.basename(p)}: {e}" for p, e in report.failed[:10])
             messagebox.showwarning("File Sorter", f"{plural(len(report.failed), 'file')} couldn't be processed "
@@ -669,8 +722,7 @@ class App(tk.Tk):
         self.current = None
         self._set_buttons(False)
         self._update_drives_label()
-        self.refresh_cards()
-        self.refresh_files()
+        self.refresh_all()
         self._write_details([(f"{verb} {plural(len(report.done), 'file')} ({human_size(report.bytes)}).\n", "title")])
 
     # ------------------------------------------------------------------ AI
@@ -700,7 +752,7 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _facts_for_ai(self, f: FileEntry) -> str:
-        sections = explain(f.path, f.assessment, f.size, f.mtime, f.atime, f.duplicate_of)
+        sections = explain(f.path, f.assessment, f.size, f.mtime, f.atime, f.duplicate_of, not f.online_only)
         lines = [f"Full path: {f.path}", f"Operating system: {sys.platform}"]
         for head, body in sections:
             if head == "First lines of the file":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import string
 import sys
@@ -27,7 +28,7 @@ class Settings:
     old_log_days: int = 30        # logs older than this are safe to delete
 
 
-@dataclass
+@dataclass(frozen=True)
 class FolderMatch:
     fragment: str
     label: str
@@ -45,6 +46,7 @@ class Assessment:
     location: FolderMatch | None = None
     contexts: list[FolderMatch] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    protected: bool = False  # belongs to an installed game/program
 
     @property
     def kind_label(self) -> str:
@@ -77,16 +79,14 @@ def base_name(path: str) -> str:
 
 
 def match_folders(path: str) -> list[FolderMatch]:
-    d = normalized_dir(path)
-    out = []
-    for frag, label, what, verdict, why in kb.FOLDER_RULES:
-        if frag.startswith("^"):
-            hit = d.startswith(frag[1:])
-        else:
-            hit = frag in d
-        if hit:
-            out.append(FolderMatch(frag, label, what, verdict, why))
-    return out
+    return list(_match_dir(normalized_dir(path)))
+
+
+@functools.lru_cache(maxsize=8192)
+def _match_dir(d: str) -> tuple[FolderMatch, ...]:
+    return tuple(FolderMatch(frag, label, what, verdict, why)
+                 for frag, label, what, verdict, why in kb.FOLDER_RULES
+                 if (d.startswith(frag[1:]) if frag.startswith("^") else frag in d))
 
 
 def extension_of(name: str) -> str:
@@ -238,7 +238,15 @@ def looks_like_installer(name: str, version_info: dict[str, str] | None = None) 
 # ---------------------------------------------------------------------------
 
 CLOUD_LABELS = {"OneDrive", "Dropbox", "Google Drive", "iCloud Drive"}
-GAME_LABELS = {"Steam game", "Epic Games game", "Xbox / Game Pass game"}
+GAME_LABELS = {"Steam game", "Epic Games game", "Xbox / Game Pass game", "GOG game"}
+
+
+def hidden_app_folder(path: str) -> str | None:
+    """Name of a hidden (dot) settings folder the file is inside, e.g. '.vscode'."""
+    for seg in normalized_dir(path).split("/"):
+        if seg.startswith(".") and seg not in kb.HIDDEN_OK and seg not in (".", ".."):
+            return seg
+    return None
 
 
 def assess(path: str, size: int, mtime: float, atime: float,
@@ -268,21 +276,35 @@ def assess(path: str, size: int, mtime: float, atime: float,
         if in_cloud and verdict in (DELETE_, REVIEW_, MOVE_):
             a.warnings.append("This file is in a cloud-synced folder: deleting or moving it here also "
                               "removes it from the cloud and your other devices.")
-        if verdict == MOVE_ and kind in kb.UNMOVABLE_KINDS:
-            a.warnings.append("Programs usually stop working if their files are moved by hand.")
         return a
 
     known = kb.KNOWN_FILES.get(name_l)
+    # system folders win over well-known names (an app's own 'index.dat' is not IE's)
+    if primary and primary.verdict == SYSTEM_ and not (known and known[1] == SYSTEM_):
+        return done(SYSTEM_, f"Inside '{primary.label}': {primary.why}")
+
     if known:
         what, verdict, why = known
         a.type_desc = what
         return done(verdict, why)
 
-    if primary and primary.verdict == SYSTEM_:
-        return done(SYSTEM_, f"Inside '{primary.label}': {primary.why}")
+    if in_game:
+        a.protected = True
+        return done(KEEP, f"Part of an installed game. {primary.why}")
 
     if primary and primary.verdict == DELETE_:
+        d = normalized_dir(path)
+        generic = primary.fragment in kb.GENERIC_CACHE_FRAGMENTS and not any(m in d for m in kb.APP_DATA_MARKERS)
+        in_trash = primary.label in ("Recycle Bin", "Trash")  # already deleted once by the user
+        if (kind in kb.PERSONAL_KINDS and not in_trash) or generic:
+            return done(REVIEW_, f"It's in a folder called '{primary.label}', but this looks like a real file, "
+                                 "not program-generated junk. Check before deleting.")
         return done(DELETE_, f"Inside '{primary.label}': {primary.why}")
+
+    hidden = hidden_app_folder(path)
+    if hidden:
+        return done(SYSTEM_, f"Inside the hidden folder '{hidden}', where a program keeps its settings and data. "
+                             "Remove it through that program instead.")
 
     if kind == "partial_download":
         if mod_age_days < 1:
@@ -314,11 +336,12 @@ def assess(path: str, size: int, mtime: float, atime: float,
     if kind in kb.UNMOVABLE_KINDS:
         return done(KEEP, "Program file. If you don't need the program, uninstall it properly instead.")
 
-    if in_game:
-        return done(KEEP, f"Part of an installed game. {primary.why}")
-
-    if size == 0:
-        return done(REVIEW_, "Empty file (0 bytes). It holds no data.")
+    if kind == "vm":
+        return done(KEEP, "Virtual machine disk. Move or delete it from inside the virtual machine app "
+                          "(VirtualBox, VMware, Hyper-V) so the app knows where it went.")
+    if kind == "email":
+        return done(KEEP, "Mailbox data. Move it from inside Outlook (or your mail app); moving the file "
+                          "by hand can make the mailbox disappear.")
 
     if kind == "backup":
         return done(REVIEW_, "Backup / old copy of another file. Delete it if the original is fine.")
@@ -331,10 +354,11 @@ def assess(path: str, size: int, mtime: float, atime: float,
         return done(MOVE_, f"Large {a.kind_label.lower()} file ({human_size(size)}). Personal files like "
                            "this don't need to be on your main drive.")
 
-    if size >= s.move_any_mb * MB:
+    movable = kind in kb.PERSONAL_KINDS or kind == "other"
+    if movable and size >= s.move_any_mb * MB:
         return done(MOVE_, f"Very large file ({human_size(size)}). Good candidate for your other drive.")
 
-    if age_days > s.stale_days and size >= s.stale_min_mb * MB:
+    if movable and age_days > s.stale_days and size >= s.stale_min_mb * MB:
         return done(MOVE_, f"Not used in {int(age_days)} days and {human_size(size)} in size. "
                            "Archive it on your other drive.")
 
@@ -375,8 +399,10 @@ def human_age(ts: float, now: float | None = None) -> str:
 
 
 def explain(path: str, assessment: Assessment, size: int, mtime: float, atime: float,
-            duplicate_of: str | None = None) -> list[tuple[str, str]]:
-    """Return (heading, text) sections describing the file."""
+            duplicate_of: str | None = None, read_contents: bool = True) -> list[tuple[str, str]]:
+    """Return (heading, text) sections describing the file.
+
+    read_contents=False skips peeking inside (reading a cloud placeholder downloads it)."""
     sections: list[tuple[str, str]] = []
     name = base_name(path)
     ext = extension_of(name)
@@ -388,7 +414,7 @@ def explain(path: str, assessment: Assessment, size: int, mtime: float, atime: f
     else:
         what.append(f"Unknown file type ({ext or 'no extension'}).")
 
-    sniffed = sniff(path)
+    sniffed = sniff(path) if read_contents else None
     if sniffed:
         desc, s_kind = sniffed
         if assessment.kind == "other":
@@ -397,7 +423,7 @@ def explain(path: str, assessment: Assessment, size: int, mtime: float, atime: f
             what.append(f"Warning: the contents look like a {desc}, but the name says otherwise. "
                         "Files pretending to be something else can be malware.")
 
-    info = windows_version_info(path) if assessment.kind in ("executable", "library", "driver", "installer") else {}
+    info = windows_version_info(path) if read_contents and assessment.kind in ("executable", "library", "driver", "installer") else {}
     if info:
         bits = []
         if info.get("FileDescription"):
@@ -437,7 +463,7 @@ def explain(path: str, assessment: Assessment, size: int, mtime: float, atime: f
         verdict.append(f"Warning: {w}")
     verdict.append("")
     verdict.append(kb.VERDICT_HELP[assessment.verdict])
-    sections.append(("Recommendation", "\n".join(v for v in verdict if v is not None)))
+    sections.append(("Recommendation", "\n".join(verdict)))
 
     # --- Facts
     facts = [
@@ -450,7 +476,8 @@ def explain(path: str, assessment: Assessment, size: int, mtime: float, atime: f
     sections.append(("Details", "\n".join(facts)))
 
     # --- Peek
-    if assessment.kind in ("text", "config", "log", "code", "script", "spreadsheet", "other") and size < 50 * MB:
+    if read_contents and assessment.kind in ("text", "config", "log", "code", "script", "spreadsheet", "other") \
+            and size < 50 * MB:
         preview = text_preview(path)
         if preview:
             sections.append(("First lines of the file", preview))
