@@ -1,0 +1,51 @@
+name: Build FileSorter.exe
+
+# Builds a single-file Windows program on every push to main and attaches it to the
+# "latest" release, so it can be downloaded without installing Python.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # to create/update the "latest" release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install pyinstaller==6.11.1 send2trash==1.8.3 pytest==8.3.4
+
+      - name: Run the tests on Windows
+        # first Windows run: report failures without blocking the build
+        continue-on-error: true
+        run: python -m pytest -q tests
+
+      - name: Build FileSorter.exe
+        run: pyinstaller --onefile --windowed --name FileSorter --hidden-import send2trash run.pyw
+
+      - name: Check the program starts
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\FileSorter.exe -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) { Write-Error "FileSorter.exe exited right away (code $($p.ExitCode))"; exit 1 }
+          Stop-Process -Id $p.Id -Force
+
+      - name: Publish to the "latest" release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view latest >/dev/null 2>&1; then
+            gh release create latest --title "File Sorter (latest build)" \
+              --notes "Built automatically from the main branch. Download FileSorter.exe and double-click it."
+          fi
+          gh release upload latest dist/FileSorter.exe --clobber

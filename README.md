@@ -11,7 +11,9 @@ Everything runs on your computer. Nothing is uploaded unless you press **Ask Cla
 
 ## Install and run
 
-You need **Python 3.10 or newer**. On Windows, get it from [python.org](https://www.python.org/downloads/) and tick *"Add python.exe to PATH"* during setup. Python comes with everything the app needs.
+**Easiest (Windows):** download **[FileSorter.exe](https://github.com/timothymasso/test/releases/download/latest/FileSorter.exe)** and double-click it. Nothing else to install. Windows may show "Windows protected your PC" because the program isn't signed: click **More info** -> **Run anyway**.
+
+**Or run it with Python** (Windows, macOS or Linux). You need **Python 3.10 or newer**. On Windows, get it from [python.org](https://www.python.org/downloads/) and tick *"Add python.exe to PATH"* during setup. Python comes with everything the app needs.
 
 1. Download this repository (green **Code** button → **Download ZIP**) and unzip it.
 2. The first time, double-click **`setup.bat`**. It installs Recycle Bin support (so deleted files can be
@@ -43,8 +45,11 @@ You need **Python 3.10 or newer**. On Windows, get it from [python.org](https://
 5. Select one or more files (Ctrl/Shift-click, or **Select all shown**), then:
    - **Move to other drive...**: pick a folder on the other drive. The original folder structure is kept, and every move is logged in `moved_by_file_sorter.csv` in that folder so you can always find things again. Files are copied and checked before the original is removed.
    - **Delete...**: sends files to the Recycle Bin (or deletes them permanently, after a warning, if `send2trash` isn't installed).
-6. To see duplicates, choose **Duplicates** in the **Show** menu: each copy is listed next to its original. **Select all shown** picks only the extra copies, and the app won't let you delete every copy of a file.
-7. The **Biggest folders** tab shows where your space goes. Double-click a folder to list its files.
+6. The **Groups** tab sorts files by what they belong to (an app's cache, a game, iPhone backups, installers, photos from 2021...). **Clean up X now** at the top deletes everything marked *Safe to delete* in one go (cloud-synced files are left out). Delete on a group only removes its *Safe to delete* files; *Review* files you pick by hand.
+7. **Right-click** any file, group or folder for more options, including **Never touch** (File Sorter will leave that folder alone from then on).
+8. **Tools** (top right): empty the Recycle Bin (deleted files only free space once it's emptied), Disk Cleanup, Storage settings, turn off hibernation, **move files back** from the other drive, and the never-touch list.
+9. To see duplicates, choose **Duplicates** in the **Show** menu: each copy is listed next to its original. **Select all shown** picks only the extra copies, and the app won't let you delete every copy of a file.
+10. The **Biggest folders** tab shows where your space goes. Double-click a folder to list its files.
 
 ### Things the app tells you to do elsewhere
 
@@ -80,6 +85,9 @@ file_sorter/
   app.py         tkinter window
   widgets.py     theme, storage bar, drive meters, space map
   treemap.py     space map layout (squarified treemap)
+  groups.py      groups files by what they belong to
+  smart.py       installed-program checks: installer versions, leftover app data
+  prefs.py       remembered settings and the never-touch list
 ```
 
 Run the tests with:
