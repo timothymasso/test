@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import knowledge as kb
-from .analysis import Assessment, Settings, assess
+from .analysis import Assessment, Settings, assess, human_size
 
 SKIP_LINUX_ROOTS = {"/proc", "/sys", "/dev", "/run"}
 
@@ -147,7 +147,15 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
     if find_duplicates and not result.cancelled:
         if progress:
             progress(len(result.files), seen_bytes, "Looking for duplicate files...")
-        mark_duplicates(result.files, cancel)
+        n_files, last = len(result.files), [0.0]
+
+        def dupe_progress(done: int, total: int) -> None:
+            if progress and time.time() - last[0] > 0.2:
+                last[0] = time.time()
+                progress(n_files, seen_bytes,
+                         f"Comparing possible duplicates: {human_size(done)} of {human_size(total)} read")
+
+        mark_duplicates(result.files, cancel, progress=dupe_progress)
         result.cancelled = cancel.is_set()
 
     result.seconds = time.time() - start
@@ -198,29 +206,43 @@ def protect_program_folders(files: list[FileEntry], scan_root: str) -> int:
 # Duplicates
 # ---------------------------------------------------------------------------
 
-def _hash(path: str, limit: int | None = None) -> str | None:
+SAMPLE = 64 * 1024
+CHUNK = 4 * 1024 * 1024
+
+
+def _sample_hash(path: str, size: int) -> str | None:
+    """Hash the start, middle and end of a file: one quick read that tells most look-alikes apart."""
     h = hashlib.blake2b(digest_size=20)
     try:
         with open(path, "rb") as f:
-            remaining = limit
-            while True:
-                chunk = f.read(1024 * 1024 if remaining is None else min(1024 * 1024, remaining))
-                if not chunk:
-                    break
+            for offset in sorted({0, max(0, size // 2 - SAMPLE // 2), max(0, size - SAMPLE)}):
+                f.seek(offset)
+                h.update(f.read(SAMPLE))
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _full_hash(path: str, cancel: threading.Event | None, on_bytes) -> str | None:
+    h = hashlib.blake2b(digest_size=20)
+    try:
+        with open(path, "rb") as f:
+            while chunk := f.read(CHUNK):
+                if cancel and cancel.is_set():
+                    return None
                 h.update(chunk)
-                if remaining is not None:
-                    remaining -= len(chunk)
-                    if remaining <= 0:
-                        break
+                on_bytes(len(chunk))
     except OSError:
         return None
     return h.hexdigest()
 
 
 def mark_duplicates(files: list[FileEntry], cancel: threading.Event | None = None,
-                    min_size: int = 1024 * 1024) -> int:
+                    min_size: int = 1024 * 1024, progress=None) -> int:
     """Find identical files (>= min_size). All copies except the oldest get a REVIEW verdict.
 
+    Same size -> same start/middle/end -> same full contents. Only files that pass the cheap
+    checks are read completely. progress(done_bytes, total_bytes) reports the full reads.
     Returns the number of files marked as duplicates.
     """
     by_size: dict[int, list[FileEntry]] = defaultdict(list)
@@ -230,38 +252,50 @@ def mark_duplicates(files: list[FileEntry], cancel: threading.Event | None = Non
                 and f.assessment.kind in kb.PERSONAL_KINDS and not f.assessment.protected):
             by_size[f.size].append(f)
 
-    marked = 0
+    candidates: list[list[FileEntry]] = []
     for size, group in by_size.items():
         if len(group) < 2:
             continue
         if cancel and cancel.is_set():
-            break
-        by_head: dict[str, list[FileEntry]] = defaultdict(list)
+            return 0
+        by_sample: dict[str, list[FileEntry]] = defaultdict(list)
         for f in _drop_hard_links(group):
-            h = _hash(f.path, 64 * 1024)
+            h = _sample_hash(f.path, size)
             if h:
-                by_head[h].append(f)
-        for head_group in by_head.values():
-            if len(head_group) < 2:
+                by_sample[h].append(f)
+        candidates += [g for g in by_sample.values() if len(g) > 1]
+
+    total = sum(f.size for g in candidates for f in g)
+    done = 0
+
+    def on_bytes(n: int) -> None:
+        nonlocal done
+        done += n
+        if progress:
+            progress(done, total)
+
+    marked = 0
+    for group in candidates:
+        by_full: dict[str, list[FileEntry]] = defaultdict(list)
+        for f in group:
+            h = _full_hash(f.path, cancel, on_bytes)
+            if cancel and cancel.is_set():
+                return marked
+            if h:
+                by_full[h].append(f)
+        for dupes in by_full.values():
+            if len(dupes) < 2:
                 continue
-            by_full: dict[str, list[FileEntry]] = defaultdict(list)
-            for f in head_group:
-                h = _hash(f.path)
-                if h:
-                    by_full[h].append(f)
-            for dupes in by_full.values():
-                if len(dupes) < 2:
-                    continue
-                dupes.sort(key=lambda f: (f.mtime, len(f.path)))
-                original = dupes[0]
-                for copy in dupes[1:]:
-                    copy.duplicate_of = original.path
-                    a = copy.assessment
-                    if a.verdict in (kb.KEEP, kb.MOVE):
-                        a.verdict = kb.REVIEW
-                        a.reason = (f"Exact duplicate of another file ({os.path.basename(original.path)}). "
-                                    "You only need one copy.")
-                    marked += 1
+            dupes.sort(key=lambda f: (f.mtime, len(f.path)))
+            original = dupes[0]
+            for copy in dupes[1:]:
+                copy.duplicate_of = original.path
+                a = copy.assessment
+                if a.verdict in (kb.KEEP, kb.MOVE):
+                    a.verdict = kb.REVIEW
+                    a.reason = (f"Exact duplicate of another file ({os.path.basename(original.path)}). "
+                                "You only need one copy.")
+                marked += 1
     return marked
 
 

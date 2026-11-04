@@ -304,3 +304,22 @@ def test_move_read_only_file(tree, tmp_path_factory):
     os.chmod(src, 0o444)
     report = actions.move_files([str(src)], str(tree), str(dest))
     assert report.done and not src.exists()
+
+
+def test_lookalikes_are_not_duplicates_and_stop_works(tree):
+    from file_sorter.scanner import mark_duplicates
+    import threading
+    vids = tree / "Videos"
+    same_start = b"\x00\x00\x00\x18ftypmp42" + b"x" * (2 * MB)
+    (vids / "one.mp4").write_bytes(same_start + b"END-ONE")
+    (vids / "two.mp4").write_bytes(same_start + b"END-TWO")
+    res = scan(str(tree), Settings(move_media_mb=1), find_duplicates=False)
+    assert mark_duplicates(res.files) == 1  # only "copy of a.mp4"
+    by_name = {f.name: f for f in res.files}
+    assert by_name["one.mp4"].duplicate_of is None and by_name["two.mp4"].duplicate_of is None
+
+    # Stop pressed: nothing is marked, and it returns right away
+    res = scan(str(tree), Settings(move_media_mb=1), find_duplicates=False)
+    stop = threading.Event()
+    stop.set()
+    assert mark_duplicates(res.files, stop) == 0
