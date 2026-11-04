@@ -14,13 +14,10 @@ Everything runs on your computer. Nothing is uploaded unless you press **Ask Cla
 You need **Python 3.10 or newer**. On Windows, get it from [python.org](https://www.python.org/downloads/) and tick *"Add python.exe to PATH"* during setup. Python comes with everything the app needs.
 
 1. Download this repository (green **Code** button → **Download ZIP**) and unzip it.
-2. Optional but recommended: so deleted files go to the Recycle Bin, open a terminal in the folder and run:
+2. The first time, double-click **`setup.bat`**. It installs Recycle Bin support (so deleted files can be
+   restored) and starts the app. On macOS/Linux run `pip install send2trash` instead.
 
-   ```bash
-   pip install send2trash
-   ```
-
-3. Start the app by double-clicking **`run.pyw`**, or from a terminal:
+3. After that, start the app by double-clicking **`run.pyw`**, or from a terminal:
 
    ```bash
    python -m file_sorter
