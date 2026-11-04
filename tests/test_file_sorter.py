@@ -12,6 +12,13 @@ from file_sorter.analysis import Settings, assess, explain, match_folders, norma
 from file_sorter.scanner import scan
 
 MB = 1024 * 1024
+
+
+@pytest.fixture(autouse=True)
+def no_real_installed_programs(monkeypatch):
+    """Scans read Windows' list of installed programs; tests must not depend on the machine they run on."""
+    from file_sorter import smart
+    monkeypatch.setattr(smart, "installed_programs", lambda: [])
 NOW = time.time()
 OLD = NOW - 800 * 86400
 
