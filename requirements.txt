@@ -1,0 +1,3 @@
+# Optional extras. File Sorter runs with plain Python (3.10+) and no packages.
+send2trash>=1.8   # deleted files go to the Recycle Bin / Trash instead of being removed permanently
+anthropic>=2.4    # "Ask Claude about this file" button (needs an ANTHROPIC_API_KEY)

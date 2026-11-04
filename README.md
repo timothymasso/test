@@ -1,0 +1,88 @@
+# File Sorter
+
+A desktop app that scans a folder or a whole drive and tells you:
+
+- **what you can get rid of**: temp files, caches, crash dumps, old logs, unfinished downloads, old installers, duplicates, empty files
+- **what you can move to your other drive**: big videos, photo libraries, archives, ISOs, virtual machine disks, backups, and big files you haven't opened in a long time
+- **what you shouldn't touch**: Windows/macOS/Linux system files, installed programs and app data
+- **what any file you click on actually is**: the file type, which program it belongs to, what happens if you delete it, and (for Windows programs) the description and maker stored inside the `.exe`/`.dll`
+
+Everything runs on your computer. Nothing is uploaded unless you press **Ask Claude** (optional, see below).
+
+## Install and run
+
+You need **Python 3.10 or newer**. On Windows, get it from [python.org](https://www.python.org/downloads/) and tick *"Add python.exe to PATH"* during setup. Python comes with everything the app needs.
+
+1. Download this repository (green **Code** button → **Download ZIP**) and unzip it.
+2. Optional but recommended: so deleted files go to the Recycle Bin, open a terminal in the folder and run:
+
+   ```bash
+   pip install send2trash
+   ```
+
+3. Start the app by double-clicking **`run.pyw`**, or from a terminal:
+
+   ```bash
+   python -m file_sorter
+   ```
+
+## How to use it
+
+1. Pick a folder, or a whole drive from **Drives**, and press **Scan**. Scanning your user folder (the default) is a good start. Scanning all of `C:\` takes longer and works best if you run the app as administrator.
+2. The coloured boxes at the top show how much space each group uses. Click one to list only those files.
+
+   | Suggestion | Meaning |
+   |---|---|
+   | **Safe to delete** (green) | Temp files, caches, crash dumps, Recycle Bin contents. Programs recreate these if they need them. |
+   | **Review** (orange) | Probably not needed: old installers, duplicates, `.bak` files, `windows.old`, `node_modules`. Check before deleting. |
+   | **Move to other drive** (blue) | Big personal files you want to keep that don't need to be on your main drive. |
+   | **Keep** (grey) | Normal files. |
+   | **System – don't touch** (red) | OS and program files. The app refuses to delete or move these. |
+
+3. Click any file to see **what it is** in the panel on the right. Text files show their first lines; files with no or misleading extensions are identified from their contents (and you get a warning if, say, a "PDF" is really a program).
+4. Select one or more files (Ctrl/Shift-click, or **Select all shown**), then:
+   - **Move to other drive...**: pick a folder on the other drive. The original folder structure is kept, and every move is logged in `moved_by_file_sorter.csv` in that folder so you can always find things again. Files are copied and checked before the original is removed.
+   - **Delete...**: sends files to the Recycle Bin (or deletes them permanently, after a warning, if `send2trash` isn't installed).
+5. The **Biggest folders** tab shows where your space goes. Double-click a folder to list its files.
+
+### Things the app tells you to do elsewhere
+
+Some big space users shouldn't be deleted by hand. The app points you to the right tool:
+
+- `hiberfil.sys`: turn hibernation off with `powercfg /hibernate off` (admin Command Prompt)
+- `pagefile.sys`: System Properties → Advanced → Performance → Virtual memory
+- `Windows.old`, Windows Update files: **Disk Cleanup** → *Clean up system files*
+- Steam / Xbox / Epic games: move them with the game launcher's own "Move" feature
+- OneDrive / Dropbox files: use "Free up space" / online-only instead of deleting
+
+## Optional: "Ask Claude about this file"
+
+For files the built-in knowledge can't explain, the **Ask Claude** button asks Claude (Anthropic's AI) what the file is and whether it's safe to remove. It sends only the file's **path, name, size, dates and detected type**, never its contents, and asks you first every time.
+
+To turn it on:
+
+```bash
+pip install anthropic
+```
+
+Then set your API key (from [console.anthropic.com](https://console.anthropic.com)) as the `ANTHROPIC_API_KEY` environment variable and restart the app. On Windows: Start → "Edit environment variables for your account" → New. Each question costs a fraction of a cent.
+
+## For developers
+
+```text
+file_sorter/
+  knowledge.py   file types, well-known files and folders, and the rules' vocabulary
+  analysis.py    assess() decides the suggestion, explain() builds the "what is this" text
+  scanner.py     walks the disk, finds duplicates, totals folder sizes
+  actions.py     move (copy, verify, delete, log) and delete (Recycle Bin)
+  ai.py          optional Claude explanation
+  app.py         tkinter window
+```
+
+Run the tests with:
+
+```bash
+pip install pytest && python -m pytest
+```
+
+To teach the app about a new file type or folder, add a line to `EXTENSIONS`, `KNOWN_FILES` or `FOLDER_RULES` in `knowledge.py`.
