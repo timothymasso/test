@@ -480,10 +480,11 @@ def test_smart_installers_and_leftovers(tree):
                       ("zoom_installer.exe", 5)):
         (dl / name).write_bytes(b"MZ" + b"\0" * 100)
         os.utime(dl / name, (NOW - age * 86400,) * 2)
-    for app in ("Spotify", "OldGameLauncher"):
+    for app, age in (("Spotify", 300), ("OldGameLauncher", 300), ("StoreGame", 2)):
         d = tree / "AppData" / "Roaming" / app
         d.mkdir(parents=True)
         (d / "settings.json").write_text("{}")
+        os.utime(d / "settings.json", (NOW - age * 86400,) * 2)
     res = scan(str(tree), Settings(), find_duplicates=False)
     installed = [Program("VLC media player", "VideoLAN", "", "3.0.20"), Program("Google Chrome"),
                  Program("Spotify", "Spotify AB")]
@@ -497,7 +498,8 @@ def test_smart_installers_and_leftovers(tree):
     assert by["zoom_installer.exe"].verdict == kb.REVIEW  # not installed: user may still need it
     settings = [f for f in res.files if f.name == "settings.json"]
     verdicts = {os.path.basename(os.path.dirname(f.path)): f.verdict for f in settings}
-    assert verdicts == {"Spotify": kb.SYSTEM, "OldGameLauncher": kb.REVIEW}
+    # StoreGame isn't registered as installed, but it's still being used: not a leftover
+    assert verdicts == {"Spotify": kb.SYSTEM, "OldGameLauncher": kb.REVIEW, "StoreGame": kb.SYSTEM}
     # without a list of installed programs nothing is guessed
     res2 = scan(str(tree), Settings(), find_duplicates=False)
     assert leftover_app_data(res2.files, []) == 0
@@ -514,6 +516,13 @@ def test_groups(tree):
     assert "Duplicate copies" in groups and groups["Duplicate copies"].files[0].name == "copy of a.mp4"
     assert any(t.startswith("Videos from ") for t in groups)
     assert "Installers" in groups
+    # a safe-to-delete old installer still groups with the installers
+    from file_sorter.analysis import Assessment
+    from file_sorter.groups import group_of
+    from file_sorter.scanner import FileEntry
+    old_inst = FileEntry("C:\\Users\\me\\Downloads\\vlc-3.0.18-win64.exe", 10, 0, 0,
+                         Assessment(kb.DELETE, "Older installer", "executable", ""))
+    assert group_of(old_inst)[1] == "Installers"
     # every file is in exactly one group
     assert sum(len(g.files) for g in groups.values()) == len(res.files)
     # groups that free the most space come first

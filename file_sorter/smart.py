@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -133,10 +134,14 @@ APPDATA_SKIP = {"microsoft", "packages", "temp", "programs", "d3dscache", "crash
                 "nvidia", "nvidia corporation", "amd", "intel", "realtek", "dell", "hp", "lenovo", "asus"}
 
 
-def leftover_app_data(files, installed: list[Program]) -> int:
+LEFTOVER_QUIET_DAYS = 60
+
+
+def leftover_app_data(files, installed: list[Program], now: float | None = None) -> int:
     """Data in AppData\\<Local|Roaming|LocalLow>\\<Folder> for programs that are no longer installed."""
     if not installed:  # no list of installed programs (not Windows): don't guess
         return 0
+    now = now or time.time()
     known = [(_norm(p.name), _norm(p.publisher), _norm(p.location)) for p in installed]
     cache: dict[str, bool] = {}
 
@@ -148,7 +153,8 @@ def leftover_app_data(files, installed: list[Program]) -> int:
                 for name, pub, loc in known)
         return cache[key]
 
-    changed = 0
+    # AppData\<area>\<folder> -> its files; only folders of programs that aren't installed
+    candidates: dict[str, list] = defaultdict(list)
     for f in files:
         a = f.assessment
         if a.verdict != kb.SYSTEM or not a.location or a.location.label != "App data":
@@ -158,11 +164,23 @@ def leftover_app_data(files, installed: list[Program]) -> int:
         for i in range(len(low) - 3):
             if low[i] == "appdata" and low[i + 1] in ("local", "roaming", "locallow"):
                 folder = parts[i + 2]
-                if folder.lower() not in APPDATA_SKIP and not is_installed(folder):
-                    a.verdict = kb.REVIEW
-                    a.reason = (f"Left over from '{folder}', which isn't in your list of installed programs. "
-                                "If you uninstalled it, this data isn't needed anymore. If you still use it "
-                                "(some apps don't register as installed), keep it.")
-                    changed += 1
+                if (folder.lower() not in APPDATA_SKIP and not folder.startswith(".")
+                        and not is_installed(folder)):
+                    candidates["/".join(parts[:i + 3])].append(f)
                 break
+
+    changed = 0
+    cutoff = now - LEFTOVER_QUIET_DAYS * 86400
+    for folder_path, group in candidates.items():
+        # an app you still use keeps writing to its folder (Store apps and some games never register
+        # as installed): only call it a leftover when nothing in it changed for a while
+        if max(f.mtime for f in group) > cutoff:
+            continue
+        folder = folder_path.rsplit("/", 1)[-1]
+        for f in group:
+            f.assessment.verdict = kb.REVIEW
+            f.assessment.reason = (f"Left over from '{folder}', which isn't in your list of installed programs and "
+                                   f"hasn't changed in {LEFTOVER_QUIET_DAYS}+ days. If you uninstalled it, this data "
+                                   "isn't needed anymore. If you still use it, keep it.")
+            changed += 1
     return changed

@@ -73,8 +73,8 @@ def group_of(f) -> tuple[str, str, str]:
         # generic folder names ("Cache folder") get the app's name in front; specific ones stand alone
         title = f"{app}: {loc.label}" if app and loc.fragment in PREFIX_WITH_APP else loc.label
         return f"loc:{title}", title, loc.what
-    if a.verdict in (kb.DELETE, kb.REVIEW) and (a.kind in JUNK_KINDS or a.verdict == kb.DELETE):
-        title, what = JUNK_KINDS.get(a.kind, JUNK_KINDS["temp"])
+    if a.verdict in (kb.DELETE, kb.REVIEW) and a.kind in JUNK_KINDS:
+        title, what = JUNK_KINDS[a.kind]
         if app:
             return f"junk:{app}:{a.kind}", f"{app}: {title.lower()}", what
         return f"junk:{a.kind}", title, what
@@ -82,6 +82,9 @@ def group_of(f) -> tuple[str, str, str]:
                                  and looks_like_installer(base_name(f.path))):
         return "installers", "Installers", "Setup programs you downloaded. Once a program is installed, " \
                                            "you don't need its installer."
+    if a.verdict == kb.DELETE:  # recognised leftovers of other kinds (Office lock files, old copies...)
+        return "junk:other", "Other leftovers", "Small leftovers File Sorter recognised, like Office lock " \
+                                                "files and half-saved copies."
     if a.reason.startswith("Left over from"):
         return f"leftover:{app or ''}", f"Leftovers: {app}" if app else "Leftover app data", \
             "Data from programs that no longer seem to be installed."
