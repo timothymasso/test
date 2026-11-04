@@ -106,6 +106,7 @@ def apply_theme(root: tk.Tk) -> dict[str, tkfont.Font]:
     style.map("TButton", background=[("disabled", BG), ("active", "#f9fafb")],
               foreground=[("disabled", "#9ca3af")])
     for name, color, hover in (("Primary", ACCENT, "#1d4ed8"), ("Danger", DANGER, "#b91c1c"),
+                               ("Clean", COLORS[kb.DELETE][0], "#15803d"),
                                ("Move", COLORS[kb.MOVE][0], "#1d4ed8")):
         style.configure(f"{name}.TButton", background=color, foreground="white", bordercolor=color,
                         lightcolor=color, darkcolor=color, font=f["bold"])

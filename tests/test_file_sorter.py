@@ -437,3 +437,110 @@ def test_unreadable_file_mid_compare_is_skipped(tree, monkeypatch):
     by_name = {f.name: f for f in res.files}
     assert by_name["p locked.mp4"].duplicate_of is None
     assert {by_name["p.mp4"].duplicate_of, by_name["p copy.mp4"].duplicate_of} - {None}
+
+
+# ------------------------------------------------------------- smarter checks and groups
+
+@pytest.mark.parametrize("path,verdict", [
+    ("C:\\Windows\\Logs\\CBS\\CbsPersist_20240101.cab", kb.DELETE),
+    ("C:\\Windows\\Installer\\1a2b3c.msi", kb.SYSTEM),
+    ("C:\\Windows\\WinSxS\\amd64_x\\file.dll", kb.SYSTEM),
+    ("C:\\ProgramData\\Package Cache\\{guid}\\vc_redist.x64.exe", kb.SYSTEM),
+    ("C:\\Users\\me\\AppData\\Roaming\\Apple Computer\\MobileSync\\Backup\\abc\\00\\0011", kb.REVIEW),
+    ("C:\\Users\\me\\AppData\\Roaming\\Adobe\\Common\\Media Cache Files\\clip.pek", kb.DELETE),
+    ("C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Crashpad\\reports\\x.dmp", kb.DELETE),
+    ("C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Teams\\Service Worker\\CacheStorage\\a\\b", kb.DELETE),
+    ("C:\\Users\\me\\Documents\\~$report.docx", kb.DELETE),
+    ("C:\\Users\\me\\AppData\\Local\\Microsoft\\Windows\\Explorer\\thumbcache_256.db", kb.DELETE),
+    ("C:\\$SysReset\\Logs\\x.etl", kb.DELETE),
+    ("C:\\ESD\\Windows\\sources\\install.esd", kb.REVIEW),
+])
+def test_smarter_verdicts(path, verdict):
+    assert a(path, mtime=OLD).verdict == verdict, a(path, mtime=OLD).reason
+
+
+def test_owning_app_names_games_and_apps():
+    assert owning_app("D:\\SteamLibrary\\steamapps\\common\\Cyberpunk 2077\\archive\\x.archive") == \
+        "Steam game: Cyberpunk 2077"
+    assert owning_app("C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cache\\f") == "Google Chrome"
+
+
+def test_product_key():
+    from file_sorter.smart import product_key
+    assert product_key("vlc-3.0.20-win64.exe") == product_key("vlc-3.0.18-win64.exe") == "vlc"
+    assert product_key("ChromeSetup.exe") == "chrome"
+    assert product_key("7z2408-x64.exe") == "7z"
+    assert product_key("node-v20.11.0-x64.msi") == "node"
+
+
+def test_smart_installers_and_leftovers(tree):
+    from file_sorter.smart import Program, leftover_app_data, smart_installers
+    dl = tree / "Downloads"
+    for name, age in (("vlc-3.0.18-win64.exe", 50), ("vlc-3.0.20-win64.exe", 10), ("ChromeSetup.exe", 5),
+                      ("zoom_installer.exe", 5)):
+        (dl / name).write_bytes(b"MZ" + b"\0" * 100)
+        os.utime(dl / name, (NOW - age * 86400,) * 2)
+    for app in ("Spotify", "OldGameLauncher"):
+        d = tree / "AppData" / "Roaming" / app
+        d.mkdir(parents=True)
+        (d / "settings.json").write_text("{}")
+    res = scan(str(tree), Settings(), find_duplicates=False)
+    installed = [Program("VLC media player", "VideoLAN", "", "3.0.20"), Program("Google Chrome"),
+                 Program("Spotify", "Spotify AB")]
+    smart_installers(res.files, installed)
+    leftover_app_data(res.files, installed)
+    by = {f.name: f for f in res.files}
+    assert by["vlc-3.0.18-win64.exe"].verdict == kb.DELETE and "newer" in by["vlc-3.0.18-win64.exe"].assessment.reason
+    assert by["vlc-3.0.20-win64.exe"].verdict == kb.DELETE and "already installed" in \
+        by["vlc-3.0.20-win64.exe"].assessment.reason
+    assert by["ChromeSetup.exe"].verdict == kb.DELETE
+    assert by["zoom_installer.exe"].verdict == kb.REVIEW  # not installed: user may still need it
+    settings = [f for f in res.files if f.name == "settings.json"]
+    verdicts = {os.path.basename(os.path.dirname(f.path)): f.verdict for f in settings}
+    assert verdicts == {"Spotify": kb.SYSTEM, "OldGameLauncher": kb.REVIEW}
+    # without a list of installed programs nothing is guessed
+    res2 = scan(str(tree), Settings(), find_duplicates=False)
+    assert leftover_app_data(res2.files, []) == 0
+
+
+def test_groups(tree):
+    from file_sorter.groups import build_groups
+    game = tree / "SteamLibrary" / "steamapps" / "common" / "Portal"
+    game.mkdir(parents=True)
+    (game / "portal.pak").write_bytes(b"x" * 1000)
+    res = scan(str(tree), Settings(move_media_mb=1))
+    groups = {g.title: g for g in build_groups(res.files)}
+    assert "Steam game: Portal" in groups
+    assert "Duplicate copies" in groups and groups["Duplicate copies"].files[0].name == "copy of a.mp4"
+    assert any(t.startswith("Videos from ") for t in groups)
+    assert "Installers" in groups
+    # every file is in exactly one group
+    assert sum(len(g.files) for g in groups.values()) == len(res.files)
+    # groups that free the most space come first
+    ordered = build_groups(res.files)
+    wins = [g.deletable + g.movable for g in ordered]
+    assert wins == sorted(wins, reverse=True)
+
+
+def test_batch_delete_reports_each_file(tree, monkeypatch):
+    calls = []
+
+    def fake_trash(p):
+        calls.append(p)
+        if isinstance(p, list):
+            for x in p[:1]:  # removes the first file, then fails
+                os.remove(x)
+            raise OSError("one file is locked")
+        if p.endswith("locked.bin"):
+            raise OSError("locked")
+        os.remove(p)
+
+    files = []
+    for name in ("one.bin", "two.bin", "locked.bin"):
+        (tree / name).write_bytes(b"x")
+        files.append(str(tree / name))
+    monkeypatch.setattr(actions, "_send2trash", fake_trash)
+    report = actions.delete_files(files)
+    assert isinstance(calls[0], list) and len(calls[0]) == 3  # one call for the whole batch
+    assert sorted(os.path.basename(p) for p, _ in report.done) == ["one.bin", "two.bin"]
+    assert [os.path.basename(p) for p, _ in report.failed] == ["locked.bin"]

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import knowledge as kb
+from . import smart
 from .analysis import Assessment, Settings, assess, human_size
 
 SKIP_LINUX_ROOTS = {"/proc", "/sys", "/dev", "/run"}
@@ -151,6 +152,11 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
     result.folder_sizes = dict(folder_sizes)
     result.folder_counts = dict(folder_counts)
     protect_program_folders(result.files, root)
+    if progress:
+        progress(len(result.files), seen_bytes, "Checking installers and leftover app data...")
+    installed = smart.installed_programs()
+    smart.smart_installers(result.files, installed)
+    smart.leftover_app_data(result.files, installed)
 
     if find_duplicates and not result.cancelled:
         if progress:

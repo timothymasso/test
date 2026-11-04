@@ -219,6 +219,56 @@ EXTENSIONS: dict[str, tuple[str, str]] = {
     ".esd": ("disk_image", "Compressed Windows installer image."),
 }
 
+EXTENSIONS.update({
+    ".avif": ("image", "AVIF image (modern web image format)."), ".jxl": ("image", "JPEG XL image."),
+    ".psb": ("design", "Large Photoshop document."), ".sketch": ("design", "Sketch design file."),
+    ".fig": ("design", "Figma design file (local copy)."), ".xd": ("design", "Adobe XD design."),
+    ".procreate": ("design", "Procreate drawing."), ".blend1": ("backup", "Blender's automatic backup of a .blend file."),
+    ".3mf": ("design", "3D-printing project."), ".gcode": ("design", "3D-printer instructions (sliced model)."),
+    ".kdenlive": ("design", "Kdenlive video project."), ".veg": ("design", "Vegas Pro video project."),
+    ".drp": ("design", "DaVinci Resolve project."), ".cab": ("archive", "Windows cabinet archive (installers, updates)."),
+    ".msp": ("installer", "Windows Installer patch."), ".nupkg": ("installer", "NuGet package (.NET library download)."),
+    ".whl": ("installer", "Python package download."), ".vsix": ("installer", "Visual Studio / VS Code extension installer."),
+    ".ipa": ("installer", "iPhone app package (old iTunes download)."), ".xapk": ("installer", "Android app package."),
+    ".hprof": ("dump", "Java memory dump (made when a Java program ran out of memory)."),
+    ".heapsnapshot": ("dump", "Browser/Node.js memory snapshot made by a developer tool."),
+    ".wer": ("dump", "Windows Error Report about a program crash."), ".crash": ("dump", "Crash report."),
+    ".ips": ("dump", "macOS crash report."), ".trace": ("log", "Performance trace recorded by a developer tool."),
+    ".chk": ("other", "Pieces of damaged files recovered by Windows CHKDSK. Almost never useful."),
+    ".!ut": ("partial_download", "uTorrent download that never finished."),
+    ".!qb": ("partial_download", "qBittorrent download that never finished."),
+    ".opdownload": ("partial_download", "Opera download that never finished."),
+    ".aria2": ("partial_download", "aria2 download progress file."),
+    ".sqlite-wal": ("database", "Database write-ahead log, part of a program's database."),
+    ".db-journal": ("database", "Database journal, part of a program's database."),
+    ".ldb": ("database", "LevelDB database file used by browsers and Electron apps."),
+    ".m3u": ("text", "Playlist."), ".m3u8": ("text", "Playlist / streaming index."), ".srt": ("text", "Subtitles."),
+    ".ass": ("text", "Subtitles."), ".nfo": ("text", "Info text that comes with downloads."),
+    ".ova": ("vm", "Exported virtual machine."), ".pvm": ("vm", "Parallels virtual machine."),
+    ".sav": ("game_data", "Game save file. Keep if you care about your progress."),
+    ".rpf": ("game_data", "Game data archive (Rockstar games)."), ".big": ("game_data", "Game data archive."),
+    ".bk2": ("game_data", "Game video (Bink)."), ".bsa": ("game_data", "Game data archive (Bethesda games)."),
+    ".esp": ("game_data", "Game mod / plugin file."), ".unity3d": ("game_data", "Unity game asset bundle."),
+    ".mca": ("game_data", "Minecraft world region file."), ".ico": ("image", "Icon image."),
+})
+
+# Name patterns for well-known files (checked after KNOWN_FILES). (pattern, what, verdict, why)
+KNOWN_PATTERNS: list[tuple[str, str, str, str]] = [
+    ("thumbcache_*.db", "Windows thumbnail cache.", "Safe to delete", "Windows rebuilds it (may need a restart)."),
+    ("iconcache_*.db", "Windows icon cache.", "Safe to delete", "Windows rebuilds it (may need a restart)."),
+    ("*.dmp", "Crash dump: a memory snapshot saved when a program crashed.", "Safe to delete",
+     "Only useful for debugging an old crash."),
+    ("cbs*.log", "Windows component servicing log.", "Safe to delete", "Only useful for troubleshooting Windows Update."),
+    ("dism*.log", "Windows image servicing log.", "Safe to delete", "Only useful for troubleshooting."),
+    ("setupact.log", "Windows setup log.", "Safe to delete", "Only useful for troubleshooting a past Windows upgrade."),
+    ("setuperr.log", "Windows setup error log.", "Safe to delete", "Only useful for troubleshooting a past Windows upgrade."),
+    ("~$*", "Office lock file: Word/Excel/PowerPoint create it while a document is open.", "Safe to delete",
+     "Left over if Office crashed. Delete it once the document is closed."),
+    ("*.~*", "Temporary copy made while a program was saving.", "Safe to delete", "A leftover from saving."),
+    ("npm-debug.log*", "npm error log.", "Safe to delete", "Only useful for debugging that one error."),
+    ("hs_err_pid*.log", "Java crash log.", "Safe to delete", "Only useful for debugging an old crash."),
+]
+
 # ---------------------------------------------------------------------------
 # Well-known individual files (matched on lowercase file name)
 # name -> (what it is, verdict, why)
@@ -319,6 +369,60 @@ FOLDER_RULES: list[tuple[str, str, str, str, str]] = [
      "Not needed after the driver is installed."),
     ("/appdata/local/packages/", "Store app data", "Data for Microsoft Store apps.", SYSTEM,
      "Clear app data from Settings -> Apps instead."),
+    # --- more Windows leftovers and big hidden space users
+    ("^/windows/logs/", "Windows logs", "Diagnostic logs Windows keeps about updates and setup. Can be several GB.",
+     DELETE, "Only useful for troubleshooting. Files Windows is still writing to will be skipped."),
+    ("^/programdata/microsoft/windows/deliveryoptimization/", "Delivery Optimization cache",
+     "Pieces of Windows updates kept to share with other PCs.", DELETE,
+     "Safe to clear. If some files refuse, use Disk Cleanup -> 'Delivery Optimization Files'."),
+    ("^/$sysreset/", "Windows reset leftovers", "Files left behind by a 'Reset this PC' that already finished.",
+     DELETE, "Not needed once the reset is done."),
+    ("^/$getcurrent/", "Windows upgrade leftovers", "Files left behind by a Windows upgrade.", DELETE,
+     "Not needed once the upgrade is done."),
+    ("^/$windows.~ls/", "Windows upgrade leftovers", "Files left behind by a Windows upgrade.", REVIEW,
+     "Remove with Disk Cleanup -> 'Temporary Windows installation files'."),
+    ("^/esd/", "Windows reinstall image", "A copy of Windows that Windows Update downloaded for repairs or upgrades.",
+     REVIEW, "Remove with Disk Cleanup -> 'Windows ESD installation files'. Only needed to reset/repair Windows."),
+    ("^/found.", "CHKDSK recovered fragments", "Pieces of damaged files that CHKDSK recovered after a disk error.",
+     REVIEW, "Almost never useful; check the sizes and delete."),
+    ("^/amd/", "AMD driver installer files", "Files the AMD driver installer unpacked.", DELETE,
+     "Not needed after the driver is installed."),
+    ("^/intel/", "Intel driver files", "Files Intel driver/support tools unpacked or logged.", REVIEW,
+     "Usually not needed after the driver is installed."),
+    ("^/swsetup/", "HP driver installers", "Driver installers HP put on the PC.", REVIEW,
+     "Only needed to reinstall drivers; HP's website has them too."),
+    ("^/drivers/", "Driver installers", "Driver installers the PC maker put on the PC.", REVIEW,
+     "Only needed to reinstall drivers; the maker's website has them too."),
+    ("^/windows/installer/", "Windows Installer cache", "Copies of installers Windows needs to repair or uninstall "
+     "programs.", SYSTEM, "Never delete these by hand: programs then can't be updated or uninstalled."),
+    ("^/windows/winsxs/", "Windows component store", "Every version of every Windows component, for updates and "
+     "repairs.", SYSTEM, "Shrink it safely with Disk Cleanup -> 'Windows Update Cleanup'."),
+    ("/package cache/", "Installer package cache", "Copies of installers (Visual Studio, C++ runtimes...) needed to "
+     "repair or uninstall them.", SYSTEM, "Deleting them breaks repairs and uninstalls of those programs."),
+    ("/apple computer/mobilesync/backup/", "iPhone / iPad backups", "Full backups of your iPhone or iPad made by "
+     "iTunes. Each can be many GB.", REVIEW, "Delete old ones from iTunes (Edit -> Preferences -> Devices), or move "
+     "them if you want to keep them."),
+    ("/apple/mobilesync/backup/", "iPhone / iPad backups", "Full backups of your iPhone or iPad made by "
+     "iTunes / Apple Devices. Each can be many GB.", REVIEW, "Delete old ones from the Apple Devices app, or move "
+     "them if you want to keep them."),
+    ("/library/application support/mobilesync/backup/", "iPhone / iPad backups", "Full backups of your iPhone or "
+     "iPad made by Finder/iTunes.", REVIEW, "Delete old ones from Finder -> your device -> Manage Backups."),
+    ("/adobe/common/media cache files/", "Adobe media cache", "Preview files Premiere/After Effects made for your "
+     "footage.", DELETE, "Adobe rebuilds them when needed (or clear in Preferences -> Media Cache)."),
+    ("/adobe/common/media cache/", "Adobe media cache", "Index of the Adobe media cache.", DELETE,
+     "Adobe rebuilds it when needed."),
+    ("/appdata/local/squirreltemp/", "App installer leftovers", "Temporary files from installing Electron apps "
+     "(Discord, Teams, Slack...).", DELETE, "Not needed after the install finished."),
+    ("/onedrive/logs/", "OneDrive logs", "OneDrive's diagnostic logs.", DELETE, "Only useful for troubleshooting."),
+    ("/library/developer/xcode/deriveddata/", "Xcode build files", "Intermediate files Xcode creates when building "
+     "apps.", DELETE, "Xcode rebuilds them."),
+    ("/library/developer/xcode/ios devicesupport/", "Xcode device support", "Debug files for iOS versions of "
+     "devices you once connected.", REVIEW, "Old iOS versions are safe to delete; Xcode re-downloads as needed."),
+    ("/.cargo/registry/", "Rust package cache", "Downloaded Rust libraries.", DELETE, "Re-downloaded when needed."),
+    ("/go/pkg/mod/", "Go module cache", "Downloaded Go libraries.", REVIEW, "Re-downloaded when needed "
+     "('go clean -modcache')."),
+    ("/appdata/local/microsoft/windows/inetcache/", "Internet cache", "Cached web content.", DELETE,
+     "Rebuilt automatically."),
     # --- operating system / installed programs (anchored to the drive root)
     ("^/windows/", "Windows", "The Windows operating system.", SYSTEM,
      "Never delete or move files here by hand. Use Disk Cleanup for safe cleanup."),
@@ -346,6 +450,8 @@ FOLDER_RULES: list[tuple[str, str, str, str, str]] = [
     ("^/dev/", "Devices", "Device files.", SYSTEM, "Not real files."),
     ("^/library/", "Library", "Shared app support files and settings (macOS).", SYSTEM, "Belongs to apps and the OS."),
     # --- games
+    ("/steamapps/shadercache/", "Steam shader cache", "Pre-compiled shaders for your Steam games.", DELETE,
+     "Rebuilt automatically."),
     ("/steamapps/downloading/", "Steam downloads in progress", "Partially downloaded Steam updates.", REVIEW,
      "Steam will re-download if needed."),
     ("/steamapps/common/", "Steam game", "An installed Steam game.", KEEP,
@@ -374,9 +480,12 @@ FOLDER_RULES: list[tuple[str, str, str, str, str]] = [
     ("/cache2/", "Browser cache", "Firefox's web cache.", DELETE, "Rebuilt automatically. Close the browser first."),
     ("/code cache/", "Browser code cache", "Cached compiled website scripts.", DELETE, "Rebuilt automatically."),
     ("/gpucache/", "GPU cache", "Cached graphics data for a browser or Electron app.", DELETE, "Rebuilt automatically."),
+    ("/cachestorage/", "Web app cache", "Offline copies of websites/web apps a browser or app saved.", DELETE,
+     "Rebuilt automatically; sites may load slower once."),
+    ("/crashpad/", "Crash reports", "Crash reports a browser or app collected.", DELETE, "Only useful for "
+     "troubleshooting."),
+    ("/crash reports/", "Crash reports", "Crash reports an app collected.", DELETE, "Only useful for troubleshooting."),
     ("/shadercache/", "Shader cache", "Pre-compiled graphics shaders.", DELETE, "Rebuilt automatically."),
-    ("/steamapps/shadercache/", "Steam shader cache", "Pre-compiled shaders for your Steam games.", DELETE,
-     "Rebuilt automatically."),
     ("/caches/", "Cache folder", "Cached data an app can rebuild.", DELETE, "Rebuilt automatically."),
     ("/.cache/", "Cache folder", "Per-user cache directory for many programs.", DELETE, "Rebuilt automatically."),
     ("/library/caches/", "macOS caches", "App caches on macOS.", DELETE, "Rebuilt automatically."),
@@ -467,6 +576,36 @@ KNOWN_APPS = {
     "packages": "Microsoft Store apps",
 }
 
+# Path fragments that name the program a file belongs to (first match wins). Matched on the
+# lowercase folder path with forward slashes.
+APP_PATHS: list[tuple[str, str]] = [
+    ("/google/chrome/", "Google Chrome"), ("/microsoft/edge/", "Microsoft Edge"),
+    ("/bravesoftware/brave-browser/", "Brave"), ("/mozilla/firefox/", "Firefox"), ("/opera software/", "Opera"),
+    ("/vivaldi/", "Vivaldi"), ("/microsoft/teams/", "Microsoft Teams"), ("/packages/msteams_", "Microsoft Teams"),
+    ("/microsoft/onedrive/", "OneDrive"), ("/microsoft/office/", "Microsoft Office"),
+    ("/microsoft/outlook/", "Outlook"), ("/microsoft/windows/explorer/", "Windows Explorer"),
+    ("/microsoft/windows/inetcache/", "Windows (internet cache)"), ("/discord/", "Discord"),
+    ("/discordptb/", "Discord"), ("/spotify/", "Spotify"), ("/slack/", "Slack"), ("/zoom/", "Zoom"),
+    ("/whatsapp/", "WhatsApp"), ("/telegram desktop/", "Telegram"), ("/signal/", "Signal"),
+    ("/steamapps/", "Steam"), ("/steam/", "Steam"), ("/epic games/", "Epic Games"),
+    ("/epicgameslauncher/", "Epic Games Launcher"), ("/gog galaxy/", "GOG Galaxy"), ("/battle.net/", "Battle.net"),
+    ("/riot games/", "Riot Games"), ("/ubisoft game launcher/", "Ubisoft Connect"), ("/ea desktop/", "EA app"),
+    ("/electronic arts/", "EA app"), ("/xboxgames/", "Xbox app"), ("/minecraft/", "Minecraft"),
+    ("/.minecraft/", "Minecraft"), ("/roblox/", "Roblox"), ("/nvidia/", "NVIDIA"), ("/nvidia corporation/", "NVIDIA"),
+    ("/amd/", "AMD"), ("/adobe/", "Adobe"), ("/obs-studio/", "OBS Studio"), ("/apple computer/mobilesync/",
+     "iPhone backups"), ("/apple/mobilesync/", "iPhone backups"), ("/mobilesync/backup/", "iPhone backups"),
+    ("/docker/", "Docker"), ("/jetbrains/", "JetBrains"), ("/appdata/roaming/code/", "Visual Studio Code"),
+    ("/appdata/local/programs/microsoft vs code/", "Visual Studio Code"), ("/.vscode/", "Visual Studio Code"),
+    ("/microsoft visual studio/", "Visual Studio"), ("/android/sdk/", "Android SDK"), ("/.android/", "Android SDK"),
+    ("/.gradle/", "Gradle (Android/Java builds)"), ("/.m2/", "Maven (Java builds)"), ("/node_modules/", "Node.js project"),
+    ("/npm-cache/", "npm"), ("/.npm/", "npm"), ("/pip/", "Python pip"), ("/anaconda3/", "Anaconda"),
+    ("/miniconda3/", "Miniconda"), ("/.cargo/", "Rust"), ("/go/pkg/", "Go"), ("/library/developer/xcode/", "Xcode"),
+    ("/library/developer/coresimulator/", "iOS Simulator"), ("/dropbox/", "Dropbox"), ("/onedrive", "OneDrive"),
+    ("/google drive/", "Google Drive"), ("/icloud", "iCloud"), ("/virtualbox vms/", "VirtualBox"),
+    ("/vmware/", "VMware"), ("/windowsapps/", "Microsoft Store apps"), ("/packages/", "Microsoft Store apps"),
+    ("/windows/softwaredistribution/", "Windows Update"), ("/windows/", "Windows"),
+]
+
 # Magic bytes for identifying files with a missing or misleading extension.
 # (prefix bytes, offset, description, kind)
 MAGIC = [
@@ -503,7 +642,8 @@ MOVABLE_KINDS = {"video", "audio", "image", "raw_photo", "archive", "disk_image"
 PERSONAL_KINDS = MOVABLE_KINDS | {"document", "spreadsheet", "presentation", "text", "email"}
 
 # Generic cache folder names only mean "deletable" inside an app-data area.
-GENERIC_CACHE_FRAGMENTS = {"/cache/", "/caches/", "/cache2/", "/code cache/", "/gpucache/", "/shadercache/"}
+GENERIC_CACHE_FRAGMENTS = {"/cache/", "/caches/", "/cache2/", "/code cache/", "/gpucache/", "/shadercache/",
+                           "/cachestorage/", "/crashpad/", "/crash reports/"}
 APP_DATA_MARKERS = ("/appdata/", "/.cache/", "/.config/", "/.local/share/", "/library/caches/",
                     "/library/application support/")
 # Hidden (dot) folders that are not app settings.

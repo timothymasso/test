@@ -115,21 +115,48 @@ def recycle_bin_works_for(path: str) -> bool:
         return True
 
 
-def delete_files(paths: list[str], permanently: bool = False) -> ActionReport:
+TRASH_BATCH = 200  # one Recycle Bin call per batch: far faster than one call per file on Windows
+
+
+def delete_files(paths: list[str], permanently: bool = False, progress=None) -> ActionReport:
     report = ActionReport()
+    if not permanently and _send2trash is None:
+        report.failed = [(p, "Recycle Bin support not installed (pip install send2trash)") for p in paths]
+        return report
+    sizes = {}
     for p in paths:
         try:
-            size = os.path.getsize(p)
-            if _send2trash is not None and not permanently:
-                _send2trash(p)
-            elif permanently:
-                os.remove(p)
-            else:
-                raise OSError("Recycle Bin support not installed (pip install send2trash)")
-            report.done.append((p, ""))
-            report.bytes += size
-        except Exception as e:  # noqa: BLE001
+            sizes[p] = os.path.getsize(p)
+        except OSError as e:
             report.failed.append((p, str(e)))
+    todo = list(sizes)
+    for start in range(0, len(todo), TRASH_BATCH if not permanently else 1):
+        batch = todo[start:start + (TRASH_BATCH if not permanently else 1)]
+        if progress:
+            progress(start, len(todo), batch[0])
+        try:
+            if permanently:
+                os.remove(batch[0])
+            else:
+                _send2trash(batch if len(batch) > 1 else batch[0])
+            done = batch
+        except Exception:  # noqa: BLE001 - one bad file fails the batch: retry one by one to find it
+            done = []
+            for p in batch:
+                if not os.path.lexists(p):  # the failed batch already removed this one
+                    done.append(p)
+                    continue
+                try:
+                    if permanently:
+                        os.remove(p)
+                    else:
+                        _send2trash(p)
+                    done.append(p)
+                except Exception as e:  # noqa: BLE001
+                    report.failed.append((p, str(e)))
+        for p in done:
+            report.done.append((p, ""))
+            report.bytes += sizes[p]
     return report
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import functools
 import os
 import string
@@ -97,10 +98,23 @@ def extension_of(name: str) -> str:
     return os.path.splitext(low)[1]
 
 
+GAME_ANCHORS = [(("steamapps", "common"), "Steam game"), (("epic games",), "Epic game"),
+                (("gog games",), "GOG game"), (("xboxgames",), "Xbox game")]
+
+
 def owning_app(path: str) -> str | None:
     """Guess which program a file belongs to from its folder."""
     parts = path.replace("\\", "/").split("/")
     low = [p.lower() for p in parts]
+    for anchor, label in GAME_ANCHORS:  # games: name the game itself
+        n = len(anchor)
+        for i in range(len(low) - n - 1):
+            if tuple(low[i:i + n]) == anchor:
+                return f"{label}: {parts[i + n]}"
+    d = normalized_dir(path)
+    for frag, app in kb.APP_PATHS:
+        if frag in d:
+            return app
     anchors = [
         ("program files",), ("program files (x86)",), ("programdata",),
         ("appdata", "local"), ("appdata", "roaming"), ("appdata", "locallow"),
@@ -288,6 +302,11 @@ def assess(path: str, size: int, mtime: float, atime: float,
         a.type_desc = what
         return done(verdict, why)
 
+    for pattern, what, verdict, why in kb.KNOWN_PATTERNS:
+        if fnmatch.fnmatchcase(name_l, pattern):
+            a.type_desc = what
+            return done(verdict, why)
+
     if in_game:
         a.protected = True
         return done(KEEP, f"Part of an installed game. {primary.why}")
@@ -296,7 +315,9 @@ def assess(path: str, size: int, mtime: float, atime: float,
         d = normalized_dir(path)
         generic = primary.fragment in kb.GENERIC_CACHE_FRAGMENTS and not any(m in d for m in kb.APP_DATA_MARKERS)
         in_trash = primary.label in ("Recycle Bin", "Trash")  # already deleted once by the user
-        if (kind in kb.PERSONAL_KINDS and not in_trash) or generic:
+        # Windows' own folders (anchored rules) never hold personal files; a top-level Temp folder might
+        windows_owned = primary.fragment.startswith("^") and primary.fragment not in ("^/temp/", "^/tmp/", "^/var/tmp/")
+        if (kind in kb.PERSONAL_KINDS and not (in_trash or windows_owned)) or generic:
             return done(REVIEW_, f"It's in a folder called '{primary.label}', but this looks like a real file, "
                                  "not program-generated junk. Check before deleting.")
         return done(DELETE_, f"Inside '{primary.label}': {primary.why}")
