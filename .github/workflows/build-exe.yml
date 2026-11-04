@@ -37,18 +37,18 @@ jobs:
       - name: Check the program starts
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath dist\FileSorter.exe -PassThru
-          $title = ""
-          for ($i = 0; $i -lt 30 -and -not $p.HasExited; $i++) {
+          # a --onefile exe starts a second FileSorter process that owns the window: look at all of them
+          Start-Process -FilePath dist\FileSorter.exe
+          $found = $null
+          for ($i = 0; $i -lt 30 -and -not $found; $i++) {
             Start-Sleep -Seconds 2
-            $p.Refresh()
-            $title = $p.MainWindowTitle
-            if ($title -like "File Sorter*") { break }
+            $found = Get-Process FileSorter -ErrorAction SilentlyContinue |
+              Where-Object { $_.MainWindowTitle -like "File Sorter*" } | Select-Object -First 1
           }
-          if ($p.HasExited) { Write-Error "FileSorter.exe exited (code $($p.ExitCode))"; exit 1 }
-          Stop-Process -Id $p.Id -Force
+          $titles = (Get-Process FileSorter -ErrorAction SilentlyContinue | ForEach-Object { $_.MainWindowTitle }) -join " | "
+          Get-Process FileSorter -ErrorAction SilentlyContinue | Stop-Process -Force
           # a crash shows an error box instead of our window: that must fail the build
-          if ($title -notlike "File Sorter*") { Write-Error "Main window not found (window title: '$title')"; exit 1 }
+          if (-not $found) { Write-Error "Main window not found (window titles: '$titles')"; exit 1 }
 
       - name: Publish to the "latest" release
         shell: bash

@@ -261,10 +261,6 @@ KNOWN_PATTERNS: list[tuple[str, str, str, str, int | None, tuple[str, ...] | Non
      None, ("/appdata/local/microsoft/windows/explorer/",)),
     ("iconcache_*.db", "Windows icon cache.", "Safe to delete", "Windows rebuilds it (may need a restart).",
      None, ("/appdata/local/microsoft/windows/explorer/",)),
-    ("iconcache.db", "Windows icon cache.", "Safe to delete", "Windows rebuilds it (may need a restart).",
-     None, ("/appdata/local/",)),
-    ("index.dat", "Old Internet Explorer history/cache index.", "Safe to delete", "Leftover from old browsers.",
-     None, ("/appdata/local/microsoft/windows/", "/appdata/roaming/microsoft/windows/")),
     ("*.dmp", "Crash dump: a memory snapshot saved when a program crashed.", "Safe to delete",
      "Only useful for debugging an old crash.", None, None),
     ("cbs*.log", "Windows component servicing log.", "Safe to delete", "Only useful for troubleshooting Windows "

@@ -50,6 +50,7 @@ class Assessment:
     contexts: list[FolderMatch] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     protected: bool = False  # belongs to an installed game/program
+    cloud: bool = False  # kept in sync by a cloud app: deleting it here deletes it everywhere
 
     @property
     def kind_label(self) -> str:
@@ -286,6 +287,11 @@ def _cloud_roots() -> tuple[str, ...]:
 CLOUD_ROOTS = _cloud_roots()
 
 
+def _on_system_drive(path: str) -> bool:
+    m = re.match(r"^([A-Za-z]):", path)
+    return bool(m) and m.group(1).upper() == os.environ.get("SystemDrive", "C:")[0].upper()
+
+
 def is_cloud_path(path: str) -> bool:
     d = normalized_dir(path)
     if any(d.startswith(r) for r in CLOUD_ROOTS):
@@ -337,7 +343,8 @@ def assess(path: str, size: int, mtime: float, atime: float,
         if in_cloud and verdict == DELETE_:  # deleting it here deletes it everywhere: never automatic
             verdict, reason = REVIEW_, f"{reason} But it's in a cloud-synced folder, so check it first."
         a.verdict, a.reason = verdict, reason
-        if in_cloud and verdict in (REVIEW_, MOVE_):
+        if in_cloud:  # whatever the verdict: a later step (duplicates) may still offer it for deleting
+            a.cloud = True
             a.warnings.append("This file is in a cloud-synced folder: deleting or moving it here also "
                               "removes it from the cloud and your other devices.")
         return a
@@ -378,7 +385,10 @@ def assess(path: str, size: int, mtime: float, atime: float,
             return done(REVIEW_, f"It's in a folder called '{primary.label}', but this looks like a real file, "
                                  "not program-generated junk. Check before deleting.")
         # folders like D:\Temp or D:\AMD can be anybody's: there only obvious junk is safe
-        if primary.fragment.startswith("^") and not (windows_owned or in_trash) and kind not in JUNK_KINDS:
+        installer_folder = primary.fragment == "^/nvidia/installer2/" or (
+            primary.fragment == "^/amd/" and _on_system_drive(path))  # C:\AMD is the AMD installer's
+        if primary.fragment.startswith("^") and not (windows_owned or in_trash or installer_folder) \
+                and kind not in JUNK_KINDS:
             return done(REVIEW_, f"It's in '{primary.label}', but folders with that name are sometimes used for "
                                  "other things, so check it first.")
         return done(DELETE_, f"Inside '{primary.label}': {primary.why}")

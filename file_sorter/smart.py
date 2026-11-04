@@ -195,7 +195,7 @@ def leftover_app_data(files, installed: list[Program], now: float | None = None)
     candidates: dict[str, list] = defaultdict(list)
     for f in files:
         a = f.assessment
-        if a.verdict != kb.SYSTEM or not a.location or a.location.label != "App data":
+        if a.verdict != kb.SYSTEM or a.protected or not a.location or a.location.label != "App data":
             continue
         parts = f.path.replace("\\", "/").split("/")
         low = [p.lower() for p in parts]

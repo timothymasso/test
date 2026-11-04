@@ -673,7 +673,9 @@ def test_prefs_roundtrip(tmp_path):
     ("C:\\Windows\\Logs\\CBS\\CBS.log", 10 * MB, kb.DELETE),
     ("D:\\AMD\\Shareholder letter.pdf", 100000, kb.REVIEW),
     ("D:\\AMD\\Ryzen build photo.jpg", 3 * MB, kb.REVIEW),
-    ("C:\\AMD\\Chipset_Drivers\\Packages\\x.inf", 1000, kb.REVIEW),
+    ("C:\\AMD\\Chipset_Drivers\\Packages\\x.inf", 1000, kb.DELETE),  # C:\AMD is the AMD installer's
+    ("D:\\AMD\\Chipset_Drivers\\Packages\\x.inf", 1000, kb.REVIEW),  # D:\AMD could be anybody's
+    ("C:\\NVIDIA\\Installer2\\Display.Driver\\nvlddmkm.sys", 1000, kb.DELETE),
     ("C:\\AMD\\Chipset_Drivers\\install.log", 1000, kb.DELETE),
     ("D:\\Temp\\MyProject\\data.db", 1000, kb.REVIEW),
     ("D:\\Temp\\MyProject\\disk.vhd", 10 * MB, kb.REVIEW),  # never deleted from a Temp-name guess
@@ -813,3 +815,64 @@ def test_prefs_with_wrong_types_fall_back(tmp_path):
     path.write_text(json.dumps({"freed_bytes": "x", "never_touch": "C:\\\\", "last_folder": 5, "stale_days": 30}))
     p = Prefs.load(str(path))
     assert p.freed_bytes == 0 and p.never_touch == [] and p.last_folder == "" and p.stale_days == 30
+
+
+
+# ------------------------------------------------------------- fourth review
+
+def test_folder_rechecked_right_before_its_batch(tree, monkeypatch):
+    from file_sorter.scanner import whole_folders
+    t = _temp_tree(tree)
+    res = scan(str(tree), find_duplicates=False)
+    singles, folders = whole_folders([f.path for f in res.files if "{guid}" in f.path], res)
+    assert list(folders) == [str(t)]
+    calls = _fake_trash(monkeypatch)
+
+    def progress(i, n, path):  # a file appears after deleting started, before the folder's turn
+        (t / "sub" / "NEW_user_file.docx").write_text("x")
+    actions.delete_files(singles, progress=progress, folders=folders)
+    assert (t / "sub" / "NEW_user_file.docx").exists() and str(t) not in calls
+
+
+def test_permanent_folder_delete_never_removes_unseen_files(tree):
+    t = _temp_tree(tree)
+    members = [str(t / "a.bin"), str(t / "sub" / "b.bin")]
+    (t / "sub" / "surprise.docx").write_text("x")
+    with pytest.raises(OSError):
+        actions._remove_folder_permanently(str(t), members)
+    assert (t / "sub" / "surprise.docx").exists()
+
+
+def test_outlook_secure_temp_folder_is_never_deleted_whole():
+    from file_sorter.scanner import _inside_junk_folder
+    base = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Microsoft", "Windows", "INetCache")
+    assert not _inside_junk_folder(os.path.join(base, "Content.Outlook", "K3J9QZ2B"))
+    assert not _inside_junk_folder(os.path.join(base, "Content.Outlook", "K3J9QZ2B", "sub"))
+
+
+def test_cloud_duplicate_is_not_offered_for_deleting(tree):
+    from file_sorter.groups import build_groups
+    data = os.urandom(2 * MB)
+    (tree / "Pictures" / "trip").mkdir(parents=True)
+    (tree / "Pictures" / "trip" / "IMG_1.jpg").write_bytes(data)
+    os.utime(tree / "Pictures" / "trip" / "IMG_1.jpg", (OLD, OLD))
+    (tree / "OneDrive" / "Pictures").mkdir(parents=True)
+    (tree / "OneDrive" / "Pictures" / "IMG_1.jpg").write_bytes(data)
+    res = scan(str(tree), Settings(move_media_mb=100))
+    cloud_copy = next(f for f in res.files if "OneDrive" in f.path)
+    assert cloud_copy.duplicate_of and cloud_copy.assessment.cloud and cloud_copy.assessment.warnings
+    dupes = next(g for g in build_groups(res.files) if g.key == "dupes")
+    deletable = [f for f in dupes.files if f.duplicate_of and not f.assessment.cloud]
+    assert cloud_copy not in deletable
+
+
+def test_leftovers_never_override_never_touch(tree):
+    from file_sorter.smart import Program, leftover_app_data
+    d = tree / "AppData" / "Roaming" / "OldGame"
+    d.mkdir(parents=True)
+    (d / "config.json").write_text("{}")
+    os.utime(d / "config.json", (NOW - 400 * 86400,) * 2)
+    res = scan(str(tree), Settings(never_touch=(str(d),)), find_duplicates=False)
+    leftover_app_data(res.files, [Program("Something Else")])
+    f = next(f for f in res.files if f.name == "config.json")
+    assert f.verdict == kb.SYSTEM and f.assessment.protected

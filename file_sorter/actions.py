@@ -52,17 +52,14 @@ def _move_one(src: str, dst: str) -> int:
     lost: our copy is removed and the original stays. Returns the size moved."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     size = os.path.getsize(src)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst), prefix=os.path.basename(dst)[:80] + ".",
-                               suffix=".filesorter-partial")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst), prefix="~fs", suffix=".tmp")  # short: MAX_PATH
     os.close(fd)
     placed = False
     try:
         shutil.copy2(src, tmp)
         if os.path.getsize(tmp) != size:
             raise OSError("the copy came out incomplete")
-        if os.path.lexists(dst):
-            raise FileExistsError(f"{dst} already exists; nothing was overwritten")
-        os.replace(tmp, dst)
+        _place(tmp, dst)
         placed = True
         try:
             os.remove(src)
@@ -78,6 +75,22 @@ def _move_one(src: str, dst: str) -> int:
                 except OSError:
                     pass
         raise
+
+
+def _place(tmp: str, dst: str) -> None:
+    """Rename tmp to dst, refusing (instead of overwriting) if dst appeared in the meantime."""
+    if sys.platform == "win32":
+        os.rename(tmp, dst)  # refuses to overwrite on Windows
+        return
+    try:
+        os.link(tmp, dst)  # refuses to overwrite
+        os.remove(tmp)
+    except FileExistsError:
+        raise
+    except OSError:  # drives without hard links (FAT/exFAT USB sticks)
+        if os.path.lexists(dst):
+            raise FileExistsError(f"{dst} already exists; nothing was overwritten")
+        os.replace(tmp, dst)
 
 
 def _log(log_path: str, src: str, dst: str, size: int) -> str | None:
@@ -224,11 +237,17 @@ def _folder_unchanged(folder: str, members: list[str]) -> bool:
     return found == expected
 
 
-def _rmtree(folder: str) -> None:
-    def retry(func, path, _exc):
-        os.chmod(path, stat.S_IWRITE)  # read-only files stop rmtree on Windows
-        func(path)
-    shutil.rmtree(folder, onerror=retry)
+def _remove_folder_permanently(folder: str, members: list[str]) -> None:
+    """Delete exactly the known files, then the (now empty) folders bottom-up. os.rmdir refuses a folder
+    that isn't empty, so nothing the scan didn't see can ever be removed this way."""
+    for m in members:
+        try:
+            os.remove(m)
+        except PermissionError:
+            os.chmod(m, stat.S_IWRITE)  # read-only files refuse removal on Windows
+            os.remove(m)
+    for d, _subdirs, _files in sorted(os.walk(folder), key=lambda t: len(t[0]), reverse=True):
+        os.rmdir(d)
 
 
 def delete_files(paths: list[str], permanently: bool = False, progress=None,
@@ -251,15 +270,20 @@ def delete_files(paths: list[str], permanently: bool = False, progress=None,
             report.failed.append((p, str(e)))
     units = [(p, [p]) for p in paths if p in sizes]
     for d, members in folders.items():
-        if members and all(m in sizes for m in members) and _folder_unchanged(d, members):
+        if members and all(m in sizes for m in members):
             units.append((d, members))
-        else:  # changed since the scan: only the files we saw go, one by one
+        else:
             units += [(m, [m]) for m in members if m in sizes]
     step = TRASH_BATCH if not permanently else 1
 
-    def remove(unit: str) -> None:
-        if permanently:
-            _rmtree(unit) if os.path.isdir(unit) and not os.path.islink(unit) else os.remove(unit)
+    def remove(unit: str, members: list[str]) -> None:
+        if unit in folders:
+            if permanently:
+                _remove_folder_permanently(unit, members)
+            else:
+                _send2trash(unit)
+        elif permanently:
+            os.remove(unit)
         else:
             _send2trash(unit)
 
@@ -274,14 +298,24 @@ def delete_files(paths: list[str], permanently: bool = False, progress=None,
                 failed.append((m, str(e)))
         return failed
 
-    for start in range(0, len(units), step):
-        batch = units[start:start + step]
+    i = 0
+    while i < len(units):
+        batch = units[i:i + step]
+        i += len(batch)
         if progress:
-            progress(start, len(units), batch[0][0])
+            progress(i - len(batch), len(units), batch[0][0])
+        # look at each folder again right before it goes: anything new means only the scanned files go
+        checked = []
+        for unit, members in batch:
+            if unit in folders and not _folder_unchanged(unit, members):
+                checked += [(m, [m]) for m in members]
+            else:
+                checked.append((unit, members))
+        batch = checked
         failed: list[tuple[str, str]] = []
         try:
             if len(batch) == 1:
-                remove(batch[0][0])
+                remove(*batch[0])
             else:
                 _send2trash([u for u, _ in batch])
         except Exception as batch_error:  # noqa: BLE001 - retry item by item to find the bad one
@@ -290,7 +324,7 @@ def delete_files(paths: list[str], permanently: bool = False, progress=None,
                     continue
                 try:
                     if len(batch) > 1:
-                        remove(unit)
+                        remove(unit, members)
                     else:
                         raise batch_error
                 except Exception as e:  # noqa: BLE001

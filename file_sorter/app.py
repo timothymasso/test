@@ -489,6 +489,9 @@ class App(tk.Tk):
                     self._show_ai_answer(ev[1], ev[2])
                 elif kind == "status":
                     self.status_var.set(ev[1])
+                elif kind == "bin_emptied":
+                    self._emptying = False
+                    self._update_drives_label()
                 elif kind == "action_done":
                     self._after_action(*ev[1:])
         except queue.Empty:
@@ -566,7 +569,7 @@ class App(tk.Tk):
     def _group_files(self, g: Group, action: str) -> list[FileEntry]:
         """Which files of a group an action applies to: only the ones suggested for it. 'Review' files
         need picking by hand (open the group), except the extra copies in the duplicates group."""
-        ok = [f for f in g.files if not f.assessment.warnings and not f.assessment.protected]
+        ok = [f for f in g.files if not f.assessment.cloud and not f.assessment.protected]
         if action == "delete":
             if g.key == "dupes":
                 return [f for f in ok if f.duplicate_of]
@@ -968,7 +971,7 @@ class App(tk.Tk):
         """One click: delete everything marked 'Safe to delete'."""
         if self.result:
             # one click needs the strictest bar: no cloud-synced files (deleting them deletes them everywhere)
-            self._delete([f for f in self.result.files if f.verdict == kb.DELETE and not f.assessment.warnings],
+            self._delete([f for f in self.result.files if f.verdict == kb.DELETE and not f.assessment.cloud],
                          cleanup=True)
 
     def _summary(self, entries: list[FileEntry]) -> str:
@@ -995,7 +998,7 @@ class App(tk.Tk):
         names = self._summary(entries)
         warn = (f"\n\n{len(risky):,} of these are marked '{kb.KEEP}' or '{kb.MOVE}'. Are you sure?"
                 if risky else "")
-        cloud = sum(1 for f in entries if f.assessment.warnings)
+        cloud = sum(1 for f in entries if f.assessment.cloud)
         if cloud:
             warn += (f"\n\n{plural(cloud, 'file')} {'is' if cloud == 1 else 'are'} in a cloud-synced folder: "
                      "deleting here also deletes from the cloud and your other devices.")
@@ -1177,11 +1180,15 @@ class App(tk.Tk):
                                f"Permanently delete everything in the Recycle Bin{size}? That includes anything "
                                "you deleted earlier in other ways, and you won't be able to restore it.",
                                default="no", icon="warning"):
+            if getattr(self, "_emptying", False):
+                return
+            self._emptying = True
             self.status_var.set("Emptying the Recycle Bin...")
 
             def work() -> None:
                 ok = actions.empty_recycle_bin()
                 self.events.put(("status", "Emptied the Recycle Bin." if ok else "The Recycle Bin wasn't emptied."))
+                self.events.put(("bin_emptied",))
             threading.Thread(target=work, daemon=True).start()
 
     def tool_hibernation(self) -> None:
