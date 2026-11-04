@@ -566,12 +566,13 @@ class App(tk.Tk):
     def _group_files(self, g: Group, action: str) -> list[FileEntry]:
         """Which files of a group an action applies to: only the ones suggested for it. 'Review' files
         need picking by hand (open the group), except the extra copies in the duplicates group."""
+        ok = [f for f in g.files if not f.assessment.warnings and not f.assessment.protected]
         if action == "delete":
             if g.key == "dupes":
-                return [f for f in g.files if f.duplicate_of]
-            return [f for f in g.files if f.verdict == kb.DELETE]
+                return [f for f in ok if f.duplicate_of]
+            return [f for f in ok if f.verdict == kb.DELETE]
         if action == "move":
-            return [f for f in g.files if f.verdict == kb.MOVE]
+            return [f for f in ok if f.verdict == kb.MOVE]
         return list(g.files)
 
     def show_group(self, g: Group) -> None:
@@ -994,6 +995,10 @@ class App(tk.Tk):
         names = self._summary(entries)
         warn = (f"\n\n{len(risky):,} of these are marked '{kb.KEEP}' or '{kb.MOVE}'. Are you sure?"
                 if risky else "")
+        cloud = sum(1 for f in entries if f.assessment.warnings)
+        if cloud:
+            warn += (f"\n\n{plural(cloud, 'file')} {'is' if cloud == 1 else 'are'} in a cloud-synced folder: "
+                     "deleting here also deletes from the cloud and your other devices.")
         drives = {os.path.splitdrive(f.path)[0]: f.path for f in entries}  # one check per drive is enough
         if all(actions.recycle_bin_works_for(p) for p in drives.values()):
             intro = ("Clean up everything marked 'Safe to delete'? These are caches, temporary files, crash "
@@ -1013,11 +1018,13 @@ class App(tk.Tk):
                                        f"({why})\n\n{names}{warn}", icon="warning"):
                 return
             permanently = True
-        singles, folders = whole_folders([f.path for f in entries], self.result) if self.result else \
-            ([f.path for f in entries], {})
+        paths, result = [f.path for f in entries], self.result
         self._last_delete_permanent = permanently
-        self._run_action("Deleting", lambda progress: actions.delete_files(singles, permanently, progress, folders),
-                         "Deleted")
+
+        def work(progress):
+            singles, folders = whole_folders(paths, result) if result else (paths, {})
+            return actions.delete_files(singles, permanently, progress, folders)
+        self._run_action("Deleting", work, "Deleted")
 
     def move_selected(self) -> None:
         entries = self._guard_system(self.selected_entries("move"), "move")
@@ -1127,26 +1134,16 @@ class App(tk.Tk):
         self.refresh_all()
         self._write_details([(f"{verb} {plural(len(report.done), 'file')} ({human_size(report.bytes)}).\n", "title")])
         if verb == "Deleted" and report.bytes and not getattr(self, "_last_delete_permanent", True):
-            self._offer_empty_recycle_bin()
-
-    def _offer_empty_recycle_bin(self) -> None:
-        """Files in the Recycle Bin still use space; offer to empty it so the space is really freed."""
-        info = actions.recycle_bin_size()
-        if not info or not info[0]:
-            return
-        size, items = info
-        if messagebox.askyesno("Empty the Recycle Bin?",
-                               f"The deleted files are in the Recycle Bin, which now holds {human_size(size)} "
-                               f"({items:,} items). That space only becomes free when the Recycle Bin is "
-                               "emptied.\n\nEmpty it now? (You won't be able to restore those files afterwards.)"):
-            if actions.empty_recycle_bin():
-                self.status_var.set(f"Emptied the Recycle Bin: {human_size(size)} freed.")
-                self._update_drives_label()
+            self.details.configure(state="normal")
+            self.details.insert("end", "\nThe files are in the Recycle Bin, so you can still restore them there. "
+                                       "The space is freed once the Recycle Bin is emptied: use Tools -> Empty "
+                                       "the Recycle Bin when you're sure.\n", ("muted",))
+            self.details.configure(state="disabled")
 
     # ------------------------------------------------------------------ tools, menus, never touch
     def _show_freed(self) -> None:
         if self.prefs.freed_bytes:
-            self.freed_label.configure(text=f"Freed with File Sorter so far: {human_size(self.prefs.freed_bytes)}")
+            self.freed_label.configure(text=f"Cleaned up with File Sorter so far: {human_size(self.prefs.freed_bytes)}")
 
     def _tools_menu(self, parent) -> tk.Menu:
         menu = tk.Menu(parent, tearoff=False)
@@ -1176,11 +1173,16 @@ class App(tk.Tk):
             messagebox.showinfo("File Sorter", "The Recycle Bin is already empty.")
             return
         size = f" ({human_size(info[0])}, {info[1]:,} items)" if info else ""
-        if messagebox.askyesno("Empty the Recycle Bin?", f"Permanently delete everything in the Recycle Bin{size}? "
-                                                         "You won't be able to restore it afterwards."):
-            if actions.empty_recycle_bin():
-                self.status_var.set("Emptied the Recycle Bin.")
-                self._update_drives_label()
+        if messagebox.askyesno("Empty the Recycle Bin?",
+                               f"Permanently delete everything in the Recycle Bin{size}? That includes anything "
+                               "you deleted earlier in other ways, and you won't be able to restore it.",
+                               default="no", icon="warning"):
+            self.status_var.set("Emptying the Recycle Bin...")
+
+            def work() -> None:
+                ok = actions.empty_recycle_bin()
+                self.events.put(("status", "Emptied the Recycle Bin." if ok else "The Recycle Bin wasn't emptied."))
+            threading.Thread(target=work, daemon=True).start()
 
     def tool_hibernation(self) -> None:
         if messagebox.askyesno("Turn off hibernation?",
@@ -1189,7 +1191,10 @@ class App(tk.Tk):
                                "Your PC will start a little slower from a full shutdown, and 'Hibernate' disappears "
                                "from the power menu. You can turn it back on with 'powercfg /hibernate on'.\n\n"
                                "Windows will ask for administrator permission. Continue?"):
-            if not actions.turn_off_hibernation():
+            if actions.turn_off_hibernation():
+                self.status_var.set("Asked Windows to turn off hibernation. hiberfil.sys disappears within a few "
+                                    "seconds (rescan to see the space).")
+            else:
                 messagebox.showwarning("File Sorter", "Hibernation wasn't turned off (permission was refused?).")
 
     def tool_move_back(self) -> None:
@@ -1222,7 +1227,7 @@ class App(tk.Tk):
 
         def add() -> None:
             d = filedialog.askdirectory(parent=win, title="Folder to never touch")
-            if d:
+            if d and os.path.abspath(d) not in self.prefs.never_touch:
                 self.never_touch(d, ask=False)
                 box.insert("end", os.path.abspath(d))
 
@@ -1249,9 +1254,13 @@ class App(tk.Tk):
             self.prefs.save()
         if self.result:
             for f in self.result.files:
-                if f.verdict != kb.KEEP and is_inside(f.path, [folder]):
+                if not is_inside(f.path, [folder]):
+                    continue
+                f.assessment.protected = True
+                f.duplicate_of, f.pre_dup = None, None
+                if f.verdict in (kb.DELETE, kb.REVIEW, kb.MOVE):  # only ever adds protection
                     index_shift(self.result, f, f.verdict, kb.KEEP)
-                    f.assessment.verdict, f.assessment.protected = kb.KEEP, True
+                    f.assessment.verdict = kb.KEEP
                     f.assessment.reason = "You told File Sorter to never touch this folder."
             self.groups = build_groups(self.result.files)
             self.refresh_all()

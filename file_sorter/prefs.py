@@ -32,9 +32,14 @@ class Prefs:
         try:
             with open(path or prefs_path(), encoding="utf-8") as f:
                 data = json.load(f)
-            known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
-            p = cls(**known)
-            p.never_touch = [str(x) for x in p.never_touch if isinstance(x, str)]
+            if not isinstance(data, dict):
+                return cls()
+            p, default = cls(), cls()
+            for name in cls.__dataclass_fields__:  # keep only values of the right type
+                value = data.get(name, getattr(default, name))
+                if isinstance(value, type(getattr(default, name))) and not isinstance(value, bool):
+                    setattr(p, name, value)
+            p.never_touch = [x for x in p.never_touch if isinstance(x, str)]
             return p
         except (OSError, ValueError, TypeError):
             return cls()

@@ -8,6 +8,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 
@@ -17,6 +18,7 @@ except Exception:  # pragma: no cover - depends on the user's machine
     _send2trash = None
 
 LOG_NAME = "moved_by_file_sorter.csv"
+LOG_HEADER = ["when", "original location", "new location", "bytes"]
 
 
 @dataclass
@@ -46,16 +48,22 @@ def destination_for(path: str, scan_root: str, dest_root: str) -> str:
 
 
 def _move_one(src: str, dst: str) -> int:
-    """Copy src to dst, check it, then remove src. On any failure nothing is lost: the copy is removed
-    and the original stays. Returns the size moved."""
-    tmp = dst + ".partial"
+    """Copy src to dst, check it, then remove src. Never overwrites anything; on any failure nothing is
+    lost: our copy is removed and the original stays. Returns the size moved."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    size = os.path.getsize(src)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst), prefix=os.path.basename(dst)[:80] + ".",
+                               suffix=".filesorter-partial")
+    os.close(fd)
+    placed = False
     try:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        size = os.path.getsize(src)
         shutil.copy2(src, tmp)
         if os.path.getsize(tmp) != size:
             raise OSError("the copy came out incomplete")
+        if os.path.lexists(dst):
+            raise FileExistsError(f"{dst} already exists; nothing was overwritten")
         os.replace(tmp, dst)
+        placed = True
         try:
             os.remove(src)
         except PermissionError:
@@ -63,8 +71,8 @@ def _move_one(src: str, dst: str) -> int:
             os.remove(src)
         return size
     except Exception:
-        for leftover in (tmp, dst if os.path.exists(src) and os.path.exists(dst) else None):
-            if leftover and os.path.exists(leftover):
+        for leftover in (tmp, dst if placed and os.path.exists(src) else None):  # only what WE created
+            if leftover and os.path.lexists(leftover):
                 try:
                     os.remove(leftover)
                 except OSError:
@@ -122,7 +130,10 @@ def move_back(log_path: str, progress=None) -> ActionReport:
     except OSError as e:
         report.failed.append((log_path, str(e)))
         return report
-    header, rows = (rows[0], rows[1:]) if rows and rows[0][:1] == ["when"] else (None, rows)
+    if not rows or rows[0] != LOG_HEADER:  # never rewrite somebody's spreadsheet
+        report.failed.append((log_path, "this isn't a File Sorter list of moved files"))
+        return report
+    header, rows = rows[0], rows[1:]
     keep = []
     for i, row in enumerate(rows):
         if len(row) < 3:
@@ -178,10 +189,53 @@ def recycle_bin_works_for(path: str) -> bool:
 TRASH_BATCH = 200  # one Recycle Bin call per batch: far faster than one call per file on Windows
 
 
+def _folder_unchanged(folder: str, members: list[str]) -> bool:
+    """True only if the folder holds exactly these files and nothing else we didn't see: no new or
+    missing files, no links or unreadable items, no empty subfolders."""
+    expected = {os.path.normcase(m) for m in members}
+    found: set[str] = set()
+    stack = [folder]
+    while stack:
+        d = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            return False
+        has_file_below = False
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    return False
+                if e.is_dir(follow_symlinks=False):
+                    attrs = getattr(e.stat(follow_symlinks=False), "st_file_attributes", 0)
+                    if attrs & 0x400:  # junction / reparse point
+                        return False
+                    stack.append(e.path)
+                    has_file_below = True  # checked when that folder is visited
+                elif e.is_file(follow_symlinks=False):
+                    found.add(os.path.normcase(e.path))
+                    has_file_below = True
+                else:
+                    return False
+            except OSError:
+                return False
+        if not has_file_below:  # an empty folder: something (or someone) may expect it
+            return False
+    return found == expected
+
+
+def _rmtree(folder: str) -> None:
+    def retry(func, path, _exc):
+        os.chmod(path, stat.S_IWRITE)  # read-only files stop rmtree on Windows
+        func(path)
+    shutil.rmtree(folder, onerror=retry)
+
+
 def delete_files(paths: list[str], permanently: bool = False, progress=None,
                  folders: dict[str, list[str]] | None = None) -> ActionReport:
     """Delete files (Recycle Bin unless permanently). `folders` maps folders to delete as a whole to
-    the files inside them: one Recycle Bin item per folder instead of one per file.
+    the files inside them: one Recycle Bin item per folder instead of one per file. Each folder is
+    looked at again first; if it holds anything the scan didn't see, its files are deleted one by one.
     report.done always lists files."""
     report = ActionReport()
     folders = folders or {}
@@ -196,43 +250,63 @@ def delete_files(paths: list[str], permanently: bool = False, progress=None,
         except OSError as e:
             report.failed.append((p, str(e)))
     units = [(p, [p]) for p in paths if p in sizes]
-    units += [(d, [m for m in members if m in sizes]) for d, members in folders.items()]
+    for d, members in folders.items():
+        if members and all(m in sizes for m in members) and _folder_unchanged(d, members):
+            units.append((d, members))
+        else:  # changed since the scan: only the files we saw go, one by one
+            units += [(m, [m]) for m in members if m in sizes]
     step = TRASH_BATCH if not permanently else 1
 
     def remove(unit: str) -> None:
         if permanently:
-            shutil.rmtree(unit) if os.path.isdir(unit) and not os.path.islink(unit) else os.remove(unit)
+            _rmtree(unit) if os.path.isdir(unit) and not os.path.islink(unit) else os.remove(unit)
         else:
             _send2trash(unit)
+
+    def remove_one_by_one(members: list[str]) -> list[tuple[str, str]]:
+        failed = []
+        for m in members:
+            if not os.path.lexists(m):
+                continue
+            try:
+                os.remove(m) if permanently else _send2trash(m)
+            except Exception as e:  # noqa: BLE001
+                failed.append((m, str(e)))
+        return failed
 
     for start in range(0, len(units), step):
         batch = units[start:start + step]
         if progress:
             progress(start, len(units), batch[0][0])
+        failed: list[tuple[str, str]] = []
         try:
             if len(batch) == 1:
                 remove(batch[0][0])
             else:
                 _send2trash([u for u, _ in batch])
-            failed_units = []
-        except Exception:  # noqa: BLE001 - one bad item fails the batch: retry one by one to find it
-            failed_units = []
+        except Exception as batch_error:  # noqa: BLE001 - retry item by item to find the bad one
             for unit, members in batch:
                 if not os.path.lexists(unit):  # the failed batch already removed this one
                     continue
                 try:
-                    remove(unit)
+                    if len(batch) > 1:
+                        remove(unit)
+                    else:
+                        raise batch_error
                 except Exception as e:  # noqa: BLE001
-                    failed_units.append((unit, members, str(e)))
-        bad = {u for u, _, _ in failed_units}
+                    if unit in folders:  # one locked file: still delete the rest of the folder
+                        failed += remove_one_by_one(members)
+                    else:
+                        failed.append((unit, str(e)))
+        bad = {p for p, _ in failed}
         for unit, members in batch:
             for m in members:
-                if unit in bad and os.path.lexists(m):
-                    continue
-                report.done.append((m, ""))
-                report.bytes += sizes[m]
-        for unit, members, err in failed_units:
-            report.failed += [(m, err) for m in members if os.path.lexists(m)]
+                if m not in bad and not os.path.lexists(m):
+                    report.done.append((m, ""))
+                    report.bytes += sizes[m]
+                elif m not in bad:
+                    failed.append((m, "it's still there"))
+        report.failed += failed
     return report
 
 

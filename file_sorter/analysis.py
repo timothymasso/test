@@ -268,6 +268,30 @@ def looks_like_installer(name: str, version_info: dict[str, str] | None = None) 
 # ---------------------------------------------------------------------------
 
 CLOUD_LABELS = {"OneDrive", "Dropbox", "Google Drive", "iCloud Drive"}
+JUNK_KINDS = {"temp", "cache", "log", "dump", "partial_download", "installer"}
+# folder names cloud apps sync ("OneDrive - Contoso", "Dropbox (Personal)", Google Drive's "My Drive")
+CLOUD_FRAGMENTS = ("/onedrive/", "/onedrive - ", "/dropbox/", "/dropbox (", "/google drive/", "/my drive/",
+                   "/icloud drive/", "/iclouddrive/", "/box/", "/pcloud drive/", "/mega/", "/nextcloud/")
+
+
+def _cloud_roots() -> tuple[str, ...]:
+    roots = []
+    for var in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer"):
+        p = os.environ.get(var)
+        if p:
+            roots.append(normalized_dir(os.path.join(p, "x")))
+    return tuple(roots)
+
+
+CLOUD_ROOTS = _cloud_roots()
+
+
+def is_cloud_path(path: str) -> bool:
+    d = normalized_dir(path)
+    if any(d.startswith(r) for r in CLOUD_ROOTS):
+        return True
+    # synced folders never live inside app data (AppData\Local\Microsoft\OneDrive is the app itself)
+    return "/appdata/" not in d and "/library/" not in d and any(f in d for f in CLOUD_FRAGMENTS)
 GAME_LABELS = {"Steam game", "Epic Games game", "Xbox / Game Pass game", "GOG game"}
 
 
@@ -297,9 +321,11 @@ def assess(path: str, size: int, mtime: float, atime: float,
     primary = next((m for m in matches if m.label not in kb.CONTEXT_ONLY_LABELS), None)
     contexts = [m for m in matches if m.label in kb.CONTEXT_ONLY_LABELS]
     in_downloads = any(m.label == "Downloads" for m in contexts)
-    in_cloud = any(m.label in CLOUD_LABELS for m in matches)
+    in_cloud = is_cloud_path(path)
     in_game = primary is not None and primary.label in GAME_LABELS
     in_user_folder = bool(contexts) and not in_downloads  # Documents, Desktop, Pictures, Videos, Music
+    d = normalized_dir(path)
+    in_app_area = any(m in d for m in kb.APP_DATA_MARKERS)  # AppData, ~/.cache, Library/Caches...
 
     last_used = max(mtime, atime)
     age_days = max(0.0, (now - last_used) / DAY)
@@ -308,8 +334,10 @@ def assess(path: str, size: int, mtime: float, atime: float,
     a = Assessment(KEEP, "", kind, type_desc, primary, contexts)
 
     def done(verdict: str, reason: str) -> Assessment:
+        if in_cloud and verdict == DELETE_:  # deleting it here deletes it everywhere: never automatic
+            verdict, reason = REVIEW_, f"{reason} But it's in a cloud-synced folder, so check it first."
         a.verdict, a.reason = verdict, reason
-        if in_cloud and verdict in (DELETE_, REVIEW_, MOVE_):
+        if in_cloud and verdict in (REVIEW_, MOVE_):
             a.warnings.append("This file is in a cloud-synced folder: deleting or moving it here also "
                               "removes it from the cloud and your other devices.")
         return a
@@ -329,9 +357,11 @@ def assess(path: str, size: int, mtime: float, atime: float,
         if (hit and (max_size is None or size <= max_size)
                 and (where is None or _in_any(path, where))):
             a.type_desc = what
-            # a name-only match in your own folders could be something you saved on purpose
-            if verdict == DELETE_ and max_size is None and where is None and in_user_folder:
-                return done(REVIEW_, f"{why} It's in one of your own folders, so check it first.")
+            # a name-only match outside app-data areas could be something somebody saved on purpose
+            if verdict == DELETE_ and max_size is None and where is None and not in_app_area \
+                    and not (primary and primary.verdict == DELETE_):
+                return done(REVIEW_, f"{why} It isn't in a place programs keep their leftovers, so check it "
+                                     "first.")
             return done(verdict, why)
 
     if in_game:
@@ -343,10 +373,14 @@ def assess(path: str, size: int, mtime: float, atime: float,
         generic = primary.fragment in kb.GENERIC_CACHE_FRAGMENTS and not any(m in d for m in kb.APP_DATA_MARKERS)
         in_trash = primary.label in ("Recycle Bin", "Trash")  # already deleted once by the user
         # Windows' own folders never hold personal files (any other folder name can, on any drive)
-        windows_owned = primary.fragment.startswith(("^/windows/", "^/$", "^/programdata/"))
+        windows_owned = primary.fragment.startswith(("^/windows/", "^/$", "^/programdata/", "^/tmp/", "^/var/tmp/"))
         if (kind in kb.PERSONAL_KINDS and not (in_trash or windows_owned)) or generic:
             return done(REVIEW_, f"It's in a folder called '{primary.label}', but this looks like a real file, "
                                  "not program-generated junk. Check before deleting.")
+        # folders like D:\Temp or D:\AMD can be anybody's: there only obvious junk is safe
+        if primary.fragment.startswith("^") and not (windows_owned or in_trash) and kind not in JUNK_KINDS:
+            return done(REVIEW_, f"It's in '{primary.label}', but folders with that name are sometimes used for "
+                                 "other things, so check it first.")
         return done(DELETE_, f"Inside '{primary.label}': {primary.why}")
 
     hidden = hidden_app_folder(path)
@@ -359,18 +393,21 @@ def assess(path: str, size: int, mtime: float, atime: float,
             return done(REVIEW_, "Unfinished download that changed in the last day; it may still be downloading.")
         return done(DELETE_, "A download that never finished. The file is incomplete and can't be used.")
 
-    if kind in ("temp", "dump", "cache") and in_user_folder:
-        return done(REVIEW_, "Looks like a leftover from a program, but it's in one of your own folders, so "
-                             "check it first.")
+    if kind in ("temp", "dump", "cache") and (in_user_folder or not in_app_area):
+        where = "one of your own folders" if in_user_folder else "a place programs normally keep leftovers"
+        return done(REVIEW_, f"Looks like a leftover from a program, but it isn't in {where}, so check it first."
+                    if not in_user_folder else f"Looks like a leftover from a program, but it's in {where}, "
+                    "so check it first.")
     if kind in ("temp", "dump", "cache"):
         return done(DELETE_, {"temp": "Temporary leftover from a program.",
                               "dump": "Crash dump; only useful for debugging an old crash.",
                               "cache": "Cache/build file that gets recreated automatically."}[kind])
 
     if kind == "log":
-        if mod_age_days > s.old_log_days and in_user_folder:
-            return done(REVIEW_, f"Old log file (not written to in {int(mod_age_days)} days). It's in one of your "
-                                 "own folders, so it could be something you saved on purpose (like chat logs).")
+        if mod_age_days > s.old_log_days and (in_user_folder or not in_app_area):
+            return done(REVIEW_, f"Old log file (not written to in {int(mod_age_days)} days). It isn't in a "
+                                 "place programs keep their logs, so it could be something saved on purpose "
+                                 "(like chat logs).")
         if mod_age_days > s.old_log_days:
             return done(DELETE_, f"Log file not written to in {int(mod_age_days)} days. "
                                  "Logs are only needed for troubleshooting.")

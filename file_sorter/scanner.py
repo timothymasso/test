@@ -6,6 +6,7 @@ import hashlib
 import heapq
 import os
 import stat
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -18,10 +19,13 @@ from .prefs import is_inside
 from .analysis import Assessment, Settings, assess, human_size, normalized_dir
 
 SKIP_LINUX_ROOTS = {"/proc", "/sys", "/dev", "/run"}
+# the packaged FileSorter.exe unpacks itself here while it runs: never suggest deleting our own files
+SKIP_SELF = {getattr(sys, "_MEIPASS")} if getattr(sys, "_MEIPASS", None) else set()
 
 # Windows file attributes
 REPARSE_POINT = 0x400  # junctions and other links (is_junction() only exists on Python 3.12+)
 ONLINE_ONLY = 0x400000 | 0x40000 | 0x1000  # OneDrive/cloud placeholders: reading them downloads them
+CLOUD_MANAGED = 0x80000 | 0x100000  # pinned / unpinned: a file a cloud app keeps in sync
 
 # Folder names that hold a program's DLLs one or two levels below its real install folder.
 BIN_DIRS = {"bin", "bin32", "bin64", "x64", "x86", "win64", "win32", "binaries", "lib", "plugins"}
@@ -130,7 +134,7 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
             result.cancelled = True
             break
         folder = stack.pop()
-        if folder in SKIP_LINUX_ROOTS:
+        if folder in SKIP_LINUX_ROOTS or folder in SKIP_SELF:
             continue
         subdirs, entries, impure, errors = _list_dir(folder)
         stack.extend(subdirs)
@@ -148,9 +152,17 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
                 a.verdict = kb.KEEP
                 a.reason = ("Online-only cloud file: it's listed here but stored in the cloud, so it "
                             "takes (almost) no space on this drive.")
+            if getattr(st, "st_file_attributes", 0) & CLOUD_MANAGED and not a.warnings:
+                a.warnings.append("This file is kept in sync by a cloud app: deleting or moving it here "
+                                  "also removes it from the cloud and your other devices.")
+                if a.verdict == kb.DELETE:
+                    a.verdict = kb.REVIEW
+                    a.reason += " But it's synced with the cloud, so check it first."
             if untouchable:
-                a.verdict, a.protected = kb.KEEP, True
-                a.reason = "You told File Sorter to never touch this folder."
+                a.protected = True
+                if a.verdict in (kb.DELETE, kb.REVIEW, kb.MOVE):  # only ever adds protection
+                    a.verdict = kb.KEEP
+                    a.reason = "You told File Sorter to never touch this folder."
             result.files.append(f)
             local_bytes += size
         seen_bytes += local_bytes
@@ -492,6 +504,9 @@ def _is_rule_folder(folder: str) -> bool:
 
 
 _DELETE_CORES = None
+# folders programs expect to exist even inside junk folders (Temp\Low has special permissions; classic
+# Outlook can't open attachments without its Content.Outlook folder)
+KEEP_FOLDER_NAMES = {"low", "content.outlook", "content.ie5", "content.mso", "content.word"}
 
 
 def _inside_junk_folder(folder: str) -> bool:
@@ -499,8 +514,11 @@ def _inside_junk_folder(folder: str) -> bool:
     inside Temp or a Cache folder). Never the rule folder itself, never anything above it."""
     global _DELETE_CORES
     if _DELETE_CORES is None:
+        # only user/app temp and cache folders: never inside Windows' own folders or the Recycle Bin
         _DELETE_CORES = [(frag.startswith("^"), frag.lstrip("^")) for frag, _l, _w, verdict, _y in kb.FOLDER_RULES
-                         if verdict == kb.DELETE]
+                         if verdict == kb.DELETE and not frag.startswith(("^/windows/", "^/$", "^/programdata/"))]
+    if os.path.basename(folder).lower() in KEEP_FOLDER_NAMES:
+        return False
     d = normalized_dir(os.path.join(folder, "x"))
     for anchored, core in _DELETE_CORES:
         if anchored:
@@ -517,6 +535,8 @@ def whole_folders(paths: list[str], result: ScanResult) -> tuple[list[str], dict
     """Split files to delete into (single files, {folder: its files}) where every file of a folder is
     being deleted. Only folders inside junk folders (Temp, caches...) are ever deleted as a whole;
     never ones holding links or unreadable items, the junk folders themselves, or anything above them."""
+    if result.cancelled:  # parts of the tree were never looked at
+        return list(paths), {}
     root = result.map_root or os.path.dirname(os.path.join(result.root, "x"))
     under: dict[str, int] = defaultdict(int)
     for p in paths:

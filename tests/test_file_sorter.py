@@ -38,7 +38,8 @@ def a(path, size=1000, mtime=NOW, atime=None):
     ("C:\\Users\\me\\Downloads\\movie.mkv.crdownload", kb.DELETE),
     ("C:\\Users\\me\\Documents\\notes.txt", kb.KEEP),
     ("D:\\Projects\\temp\\thesis.docx", kb.KEEP),
-    ("C:\\Temp\\leftover.dat", kb.DELETE),
+    ("C:\\Temp\\leftover.dat", kb.REVIEW),  # a top-level Temp folder can be anybody's
+    ("C:\\Temp\\setup_log.tmp", kb.DELETE),
     ("/tmp/abc.dat", kb.DELETE),
     ("C:\\Users\\me\\Pictures\\Thumbs.db", kb.DELETE),
     ("/Users/me/Library/Caches/com.apple.Safari/Cache.db", kb.DELETE),
@@ -85,8 +86,11 @@ def test_old_unused_file_should_move():
 
 
 def test_recent_log_kept_old_log_deleted():
-    assert a("C:\\Users\\me\\app\\run.log", mtime=NOW).verdict == kb.KEEP
-    assert a("C:\\Users\\me\\app\\run.log", mtime=OLD).verdict == kb.DELETE
+    assert a("D:\\Projects\\server\\logs\\chat.log", mtime=NOW).verdict == kb.KEEP  # still being written
+    assert a("C:\\Temp\\installer\\run.log", mtime=OLD).verdict == kb.DELETE
+    assert a("C:\\Users\\me\\AppData\\Local\\SomeApp\\run.log", mtime=OLD).verdict == kb.SYSTEM
+    # outside app data an old log could be something saved on purpose
+    assert a("D:\\Projects\\server\\logs\\chat.log", mtime=OLD).verdict == kb.REVIEW
 
 
 def test_partial_download_in_progress_is_not_deleted():
@@ -669,7 +673,17 @@ def test_prefs_roundtrip(tmp_path):
     ("C:\\Windows\\Logs\\CBS\\CBS.log", 10 * MB, kb.DELETE),
     ("D:\\AMD\\Shareholder letter.pdf", 100000, kb.REVIEW),
     ("D:\\AMD\\Ryzen build photo.jpg", 3 * MB, kb.REVIEW),
-    ("C:\\AMD\\Chipset_Drivers\\Packages\\x.inf", 1000, kb.DELETE),
+    ("C:\\AMD\\Chipset_Drivers\\Packages\\x.inf", 1000, kb.REVIEW),
+    ("C:\\AMD\\Chipset_Drivers\\install.log", 1000, kb.DELETE),
+    ("D:\\Temp\\MyProject\\data.db", 1000, kb.REVIEW),
+    ("D:\\Temp\\MyProject\\disk.vhd", 10 * MB, kb.REVIEW),  # never deleted from a Temp-name guess
+    ("C:\\Users\\me\\OneDrive - Contoso\\Projects\\build.log", 1000, kb.REVIEW),
+    ("C:\\Users\\me\\OneDrive - Contoso\\Projects\\x.tmp", 1000, kb.REVIEW),
+    ("C:\\Users\\me\\iCloudDrive\\Notes\\old.log", 1000, kb.REVIEW),
+    ("G:\\My Drive\\Work\\server.log", 1000, kb.REVIEW),
+    ("C:\\Users\\me\\Dropbox (Personal)\\logs\\a.log", 1000, kb.REVIEW),
+    ("D:\\Games\\Portable\\index.dat", 1000, kb.KEEP),
+    ("D:\\Projects\\x\\build\\main.pyc", 1000, kb.REVIEW),
     ("C:\\Users\\me\\OneDrive\\Logs\\config.json", 1000, kb.KEEP),
     ("C:\\Users\\me\\AppData\\Local\\Microsoft\\OneDrive\\logs\\Business1\\x.odl", 1000, kb.DELETE),
     ("C:\\Users\\me\\Documents\\oracle_export.dmp", 50 * MB, kb.REVIEW),
@@ -678,3 +692,124 @@ def test_prefs_roundtrip(tmp_path):
 def test_review_false_positives(path, size, verdict):
     r = a(path, size=size, mtime=OLD)
     assert r.verdict == verdict, r.reason
+
+
+# ------------------------------------------------------------- third review: data-safety regressions
+
+def _temp_tree(tree):
+    t = tree / "AppData" / "Local" / "Temp" / "{guid}"
+    (t / "sub").mkdir(parents=True)
+    (t / "a.bin").write_bytes(b"x")
+    (t / "sub" / "b.bin").write_bytes(b"x")
+    return t
+
+
+def _fake_trash(monkeypatch, locked=()):
+    calls = []
+
+    def trash(p):
+        for x in (p if isinstance(p, list) else [p]):
+            if any(str(x).endswith(name) for name in locked):
+                raise OSError("in use")
+            calls.append(str(x))
+            (shutil.rmtree if os.path.isdir(x) else os.remove)(x)
+    monkeypatch.setattr(actions, "_send2trash", trash)
+    return calls
+
+
+def test_folder_with_a_new_file_is_not_deleted_whole(tree, monkeypatch):
+    from file_sorter.scanner import whole_folders
+    t = _temp_tree(tree)
+    res = scan(str(tree), find_duplicates=False)
+    paths = [f.path for f in res.files if "{guid}" in f.path]
+    singles, folders = whole_folders(paths, res)
+    assert list(folders) == [str(t)]
+    (t / "sub" / "thesis.docx").write_text("written after the scan")
+    calls = _fake_trash(monkeypatch)
+    report = actions.delete_files(singles, folders=folders)
+    assert str(t) not in calls  # looked again, saw the new file, deleted file by file instead
+    assert (t / "sub" / "thesis.docx").exists()
+    assert len(report.done) == 2 and not report.failed
+
+
+def test_folder_with_an_empty_subfolder_is_not_deleted_whole(tree, monkeypatch):
+    from file_sorter.scanner import whole_folders
+    t = _temp_tree(tree)
+    (t / "keepme").mkdir()
+    res = scan(str(tree), find_duplicates=False)
+    singles, folders = whole_folders([f.path for f in res.files if "{guid}" in f.path], res)
+    calls = _fake_trash(monkeypatch)
+    actions.delete_files(singles, folders=folders)
+    assert (t / "keepme").is_dir() and str(t) not in calls
+
+
+def test_locked_file_in_a_folder_still_frees_the_rest(tree, monkeypatch):
+    from file_sorter.scanner import whole_folders
+    t = _temp_tree(tree)
+    (t / "locked.bin").write_bytes(b"x")
+    res = scan(str(tree), find_duplicates=False)
+    singles, folders = whole_folders([f.path for f in res.files if "{guid}" in f.path], res)
+
+    def trash(p):
+        if os.path.isdir(p):
+            raise OSError("a file in it is in use")
+        if str(p).endswith("locked.bin"):
+            raise OSError("in use")
+        os.remove(p)
+    monkeypatch.setattr(actions, "_send2trash", trash)
+    report = actions.delete_files(singles, folders=folders)
+    assert sorted(os.path.basename(p) for p, _ in report.done) == ["a.bin", "b.bin"]
+    assert [os.path.basename(p) for p, _ in report.failed] == ["locked.bin"]
+
+
+def test_no_whole_folders_after_a_stopped_scan(tree):
+    from file_sorter.scanner import whole_folders
+    _temp_tree(tree)
+    res = scan(str(tree), find_duplicates=False)
+    res.cancelled = True
+    singles, folders = whole_folders([f.path for f in res.files if "{guid}" in f.path], res)
+    assert folders == {}
+
+
+def test_never_whole_inside_windows_folders_or_special_names(tree):
+    from file_sorter.scanner import _inside_junk_folder
+    assert _inside_junk_folder("C:\\Users\\me\\AppData\\Local\\Temp\\{guid}") if os.sep == "\\" else True
+    assert not _inside_junk_folder(str(tree / "AppData" / "Local" / "Temp" / "Low"))
+    assert not _inside_junk_folder(str(tree / "AppData" / "Local" / "Microsoft" / "Windows" / "INetCache" /
+                                       "Content.Outlook"))
+
+
+def test_move_back_refuses_other_csv_files(tmp_path):
+    bank = tmp_path / "bank.csv"
+    bank.write_text("Date,Description,Amount,Balance\n2024-01-01,Coffee,-3\n")
+    before = bank.read_text()
+    report = actions.move_back(str(bank))
+    assert report.failed and bank.read_text() == before
+
+
+def test_move_never_overwrites_a_partial_file(tree, tmp_path_factory):
+    dest = tmp_path_factory.mktemp("otherdrive")
+    target = dest / tree.name / "Videos" / "a.mp4.partial"
+    target.parent.mkdir(parents=True)
+    target.write_text("someone's real file")
+    report = actions.move_files([str(tree / "Videos" / "a.mp4")], str(tree), str(dest))
+    assert report.done and target.read_text() == "someone's real file"
+
+
+def test_never_touch_never_weakens_system_files(tree):
+    git = tree / "code" / ".git" / "objects"
+    git.mkdir(parents=True)
+    (git / "pack").write_bytes(b"x")
+    res = scan(str(tree), Settings(never_touch=(str(tree),)), find_duplicates=False)
+    by = {f.name: f for f in res.files}
+    assert by["pack"].verdict == kb.SYSTEM  # still refused outright, not just "are you sure?"
+    assert by["blob"].verdict == kb.KEEP and by["blob"].assessment.protected
+
+
+def test_prefs_with_wrong_types_fall_back(tmp_path):
+    import json
+    from file_sorter.prefs import Prefs
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps({"freed_bytes": "x", "never_touch": "C:\\\\", "last_folder": 5, "stale_days": 30}))
+    p = Prefs.load(str(path))
+    assert p.freed_bytes == 0 and p.never_touch == [] and p.last_folder == "" and p.stale_days == 30

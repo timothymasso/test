@@ -261,6 +261,10 @@ KNOWN_PATTERNS: list[tuple[str, str, str, str, int | None, tuple[str, ...] | Non
      None, ("/appdata/local/microsoft/windows/explorer/",)),
     ("iconcache_*.db", "Windows icon cache.", "Safe to delete", "Windows rebuilds it (may need a restart).",
      None, ("/appdata/local/microsoft/windows/explorer/",)),
+    ("iconcache.db", "Windows icon cache.", "Safe to delete", "Windows rebuilds it (may need a restart).",
+     None, ("/appdata/local/",)),
+    ("index.dat", "Old Internet Explorer history/cache index.", "Safe to delete", "Leftover from old browsers.",
+     None, ("/appdata/local/microsoft/windows/", "/appdata/roaming/microsoft/windows/")),
     ("*.dmp", "Crash dump: a memory snapshot saved when a program crashed.", "Safe to delete",
      "Only useful for debugging an old crash.", None, None),
     ("cbs*.log", "Windows component servicing log.", "Safe to delete", "Only useful for troubleshooting Windows "
@@ -319,8 +323,6 @@ KNOWN_FILES: dict[str, tuple[str, str, str]] = {
     "usrclass.dat": ("Part of your Windows profile registry.", SYSTEM, "Managed by Windows."),
     "bootmgr": ("Windows boot manager.", SYSTEM, "Your PC won't start without it."),
     "bootnxt": ("Windows boot file.", SYSTEM, "Needed to start Windows."),
-    "iconcache.db": ("Windows icon cache.", DELETE, "Windows rebuilds it (may need a restart)."),
-    "index.dat": ("Old Internet Explorer history/cache index.", DELETE, "Leftover from old browsers."),
     "package-lock.json": ("npm dependency lock file for a JavaScript project.", KEEP, "Part of a code project."),
     ".gitignore": ("Tells Git which files to ignore in a code project.", KEEP, "Part of a code project."),
 }
