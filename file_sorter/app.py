@@ -32,6 +32,7 @@ VERDICT_BG = {
     kb.SYSTEM: "#fce8e6",
 }
 ALL = "Everything"
+DUPES = "Duplicates (copies and originals)"
 RUNNABLE_KINDS = {"executable", "library", "driver", "script", "installer"}
 RUNNABLE_EXTS = (".exe", ".com", ".scr", ".pif", ".bat", ".cmd", ".vbs", ".js", ".jse", ".wsf", ".ps1",
                  ".msi", ".lnk", ".reg", ".hta", ".jar")
@@ -147,7 +148,7 @@ class App(tk.Tk):
         bar = ttk.Frame(files_tab)
         bar.pack(fill="x", pady=(0, 4))
         ttk.Label(bar, text="Show:").pack(side="left")
-        show = ttk.Combobox(bar, textvariable=self.show_var, values=[ALL] + kb.VERDICTS,
+        show = ttk.Combobox(bar, textvariable=self.show_var, values=[ALL] + kb.VERDICTS + [DUPES],
                             state="readonly", width=26)
         show.pack(side="left", padx=4)
         show.bind("<<ComboboxSelected>>", lambda e: self.refresh_files())
@@ -396,6 +397,9 @@ class App(tk.Tk):
             self.after_cancel(self._debounce)
         self._debounce = self.after(250, self.refresh_files)
 
+    def _originals(self) -> set[str]:
+        return {f.duplicate_of for f in self.result.files if f.duplicate_of} if self.result else set()
+
     def _filtered(self) -> list[FileEntry]:
         if not self.result:
             return []
@@ -404,9 +408,13 @@ class App(tk.Tk):
         prefix = None
         if self.folder_filter:
             prefix = os.path.join(self.folder_filter, "")
+        originals = self._originals() if show == DUPES else set()
         out = []
         for f in self.result.files:
-            if show != ALL and f.verdict != show:
+            if show == DUPES:
+                if not (f.duplicate_of or f.path in originals):
+                    continue
+            elif show != ALL and f.verdict != show:
                 continue
             if prefix and not f.path.startswith(prefix):
                 continue
@@ -418,6 +426,7 @@ class App(tk.Tk):
     def refresh_files(self) -> None:
         self.refresh_cards()
         items = self._filtered()
+        originals = self._originals()
         keyfuncs = {
             "name": lambda f: f.name.lower(),
             "size": lambda f: f.size,
@@ -437,10 +446,16 @@ class App(tk.Tk):
             days = int((now - max(f.mtime, f.atime)) / 86400)
             used = "today" if days < 1 else f"{days} d ago" if days < 60 else \
                 f"{days // 30} mo ago" if days < 730 else f"{days / 365:.1f} y ago"
-            label = kb.SHORT[f.verdict] + (" (duplicate)" if f.duplicate_of else "")
+            label = kb.SHORT[f.verdict] + (" (duplicate)" if f.duplicate_of else
+                                           " (has copies)" if f.path in originals else "")
             self.tree.insert("", "end", iid=iid, tags=(f.verdict,),
                              values=(f.name, human_size(f.size), label, f.assessment.kind_label,
                                      used, os.path.dirname(f.path)))
+        if not items and self.show_var.get() == DUPES and self.result:
+            self._write_details([("No duplicates found\n", "title"),
+                                 ("Make sure 'Find duplicate files' is ticked at the top, then press Scan again. "
+                                  "Only personal files of 1 MB or more (photos, videos, documents, archives...) "
+                                  "are compared.\n", "")])
         total = sum(f.size for f in items)
         extra = f" (showing the first {MAX_ROWS:,})" if len(items) > MAX_ROWS else ""
         self.tabs.tab(0, text=f"Files - {len(items):,} - {human_size(total)}{extra}")
