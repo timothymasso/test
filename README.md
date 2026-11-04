@@ -26,7 +26,10 @@ You need **Python 3.10 or newer**. On Windows, get it from [python.org](https://
 ## How to use it
 
 1. Pick a folder, or a whole drive from **Drives**, and press **Scan**. Scanning your user folder (the default) is a good start. Scanning all of `C:\` takes longer and works best if you run the app as administrator.
-2. The coloured boxes at the top show how much space each group uses. Click one to list only those files.
+   - **Scan** is quick and skips duplicates.
+   - **Scan + find duplicates** also finds identical copies of your files. It takes longer because it has to compare file contents; you can press **Stop** at any time.
+2. The **Space map** shows where your space goes: every box is a folder, sized by how much it holds and coloured by what's inside (green = delete, yellow = review, blue = move, grey = keep, red = don't touch). Click a box to look inside it.
+3. The coloured cards and the bar under them show how much space each group uses. Click one to list only those files.
 
    | Suggestion | Meaning |
    |---|---|
@@ -36,11 +39,12 @@ You need **Python 3.10 or newer**. On Windows, get it from [python.org](https://
    | **Keep** (grey) | Normal files. |
    | **System – don't touch** (red) | OS and program files. The app refuses to delete or move these. |
 
-3. Click any file to see **what it is** in the panel on the right. Text files show their first lines; files with no or misleading extensions are identified from their contents (and you get a warning if, say, a "PDF" is really a program).
-4. Select one or more files (Ctrl/Shift-click, or **Select all shown**), then:
+4. Click any file to see **what it is** in the panel on the right. Text files show their first lines; files with no or misleading extensions are identified from their contents (and you get a warning if, say, a "PDF" is really a program).
+5. Select one or more files (Ctrl/Shift-click, or **Select all shown**), then:
    - **Move to other drive...**: pick a folder on the other drive. The original folder structure is kept, and every move is logged in `moved_by_file_sorter.csv` in that folder so you can always find things again. Files are copied and checked before the original is removed.
    - **Delete...**: sends files to the Recycle Bin (or deletes them permanently, after a warning, if `send2trash` isn't installed).
-5. The **Biggest folders** tab shows where your space goes. Double-click a folder to list its files.
+6. To see duplicates, choose **Duplicates** in the **Show** menu: each copy is listed next to its original. **Select all shown** picks only the extra copies, and the app won't let you delete every copy of a file.
+7. The **Biggest folders** tab shows where your space goes. Double-click a folder to list its files.
 
 ### Things the app tells you to do elsewhere
 
@@ -74,6 +78,8 @@ file_sorter/
   actions.py     move (copy, verify, delete, log) and delete (Recycle Bin)
   ai.py          optional Claude explanation
   app.py         tkinter window
+  widgets.py     theme, storage bar, drive meters, space map
+  treemap.py     space map layout (squarified treemap)
 ```
 
 Run the tests with:

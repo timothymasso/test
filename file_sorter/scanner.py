@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import os
 import stat
 import threading
@@ -33,6 +34,7 @@ class FileEntry:
     atime: float
     assessment: Assessment
     duplicate_of: str | None = None
+    pre_dup: tuple[str, str] | None = None  # verdict and reason before it was marked a duplicate
     online_only: bool = False
 
     @property
@@ -53,6 +55,12 @@ class ScanResult:
     errors: int = 0
     seconds: float = 0.0
     cancelled: bool = False
+    duplicates_checked: bool = False
+    # space map index: folder -> verdict -> bytes (direct files / including subfolders), and subfolders
+    map_root: str = ""
+    by_dir: dict[str, dict[str, int]] = field(default_factory=dict)
+    breakdown: dict[str, dict[str, int]] = field(default_factory=dict)
+    subfolders: dict[str, set[str]] = field(default_factory=dict)
 
     def totals(self) -> dict[str, tuple[int, int]]:
         """verdict -> (file count, total bytes)"""
@@ -149,14 +157,16 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
             progress(len(result.files), seen_bytes, "Looking for duplicate files...")
         n_files, last = len(result.files), [0.0]
 
-        def dupe_progress(done: int, total: int) -> None:
+        def dupe_progress(message: str) -> None:
             if progress and time.time() - last[0] > 0.2:
                 last[0] = time.time()
-                progress(n_files, seen_bytes,
-                         f"Comparing possible duplicates: {human_size(done)} of {human_size(total)} read")
+                progress(n_files, seen_bytes, message)
 
         mark_duplicates(result.files, cancel, progress=dupe_progress)
         result.cancelled = cancel.is_set()
+        result.duplicates_checked = not result.cancelled
+
+    build_index(result)
 
     result.seconds = time.time() - start
     return result
@@ -208,42 +218,89 @@ def protect_program_folders(files: list[FileEntry], scan_root: str) -> int:
 
 SAMPLE = 64 * 1024
 CHUNK = 4 * 1024 * 1024
+MAX_OPEN = 64  # compare at most this many same-looking files side by side
 
 
-def _sample_hash(path: str, size: int) -> str | None:
-    """Hash the start, middle and end of a file: one quick read that tells most look-alikes apart."""
-    h = hashlib.blake2b(digest_size=20)
+def _read_at(path: str, offsets: tuple[int, ...]) -> bytes | None:
     try:
         with open(path, "rb") as f:
-            for offset in sorted({0, max(0, size // 2 - SAMPLE // 2), max(0, size - SAMPLE)}):
-                f.seek(offset)
-                h.update(f.read(SAMPLE))
+            out = b""
+            for off in offsets:
+                f.seek(off)
+                out += f.read(SAMPLE)
+            return hashlib.blake2b(out, digest_size=20).digest()
     except OSError:
         return None
-    return h.hexdigest()
 
 
-def _full_hash(path: str, cancel: threading.Event | None, on_bytes) -> str | None:
-    h = hashlib.blake2b(digest_size=20)
+def _split(group: list[FileEntry], key) -> list[list[FileEntry]]:
+    buckets: dict[object, list[FileEntry]] = defaultdict(list)
+    for f in group:
+        k = key(f)
+        if k is not None:
+            buckets[k].append(f)
+    return [g for g in buckets.values() if len(g) > 1]
+
+
+def _identical(group: list[FileEntry], cancel, on_bytes) -> list[list[FileEntry]]:
+    """Read same-size files side by side, chunk by chunk, dropping each one the moment it differs."""
+    if len(group) > MAX_OPEN:  # too many to keep open at once: split by a hash of the whole file
+        def whole(f: FileEntry):
+            h = hashlib.blake2b(digest_size=20)
+            try:
+                with open(f.path, "rb") as fh:
+                    while chunk := fh.read(CHUNK):
+                        if cancel and cancel.is_set():
+                            return None
+                        h.update(chunk)
+                        on_bytes(len(chunk))
+            except OSError:
+                return None
+            return h.digest()
+        return _split(group, whole)
+
+    handles = {}
     try:
-        with open(path, "rb") as f:
-            while chunk := f.read(CHUNK):
-                if cancel and cancel.is_set():
-                    return None
-                h.update(chunk)
-                on_bytes(len(chunk))
-    except OSError:
-        return None
-    return h.hexdigest()
+        for f in group:
+            try:
+                handles[f.path] = open(f.path, "rb")
+            except OSError:
+                pass
+        groups = [[f for f in group if f.path in handles]]
+        done: list[list[FileEntry]] = []
+        while groups:
+            if cancel and cancel.is_set():
+                return []
+            nxt = []
+            for g in groups:
+                prints = {}  # path -> fingerprint of its next chunk; one chunk in memory at a time
+                ended = True
+                for f in g:
+                    try:
+                        chunk = handles[f.path].read(CHUNK)
+                    except OSError:  # locked or vanished mid-read: just leave it out
+                        continue
+                    on_bytes(len(chunk))
+                    ended = ended and not chunk
+                    prints[f.path] = hashlib.blake2b(chunk, digest_size=20).digest()
+                if ended and len(prints) > 1:  # all reached the end together: identical
+                    done.append([f for f in g if f.path in prints])
+                    continue
+                nxt += _split(g, lambda f: prints.get(f.path))
+            groups = nxt
+        return done
+    finally:
+        for h in handles.values():
+            h.close()
 
 
 def mark_duplicates(files: list[FileEntry], cancel: threading.Event | None = None,
                     min_size: int = 1024 * 1024, progress=None) -> int:
     """Find identical files (>= min_size). All copies except the oldest get a REVIEW verdict.
 
-    Same size -> same start/middle/end -> same full contents. Only files that pass the cheap
-    checks are read completely. progress(done_bytes, total_bytes) reports the full reads.
-    Returns the number of files marked as duplicates.
+    Same size -> same first 64 KB -> same middle and end -> same contents, compared side by
+    side so that look-alikes stop being read as soon as they differ.
+    progress(message) reports what's happening. Returns the number of files marked.
     """
     by_size: dict[int, list[FileEntry]] = defaultdict(list)
     for f in files:
@@ -251,19 +308,20 @@ def mark_duplicates(files: list[FileEntry], cancel: threading.Event | None = Non
         if (f.size >= min_size and f.verdict in (kb.KEEP, kb.MOVE) and not f.online_only
                 and f.assessment.kind in kb.PERSONAL_KINDS and not f.assessment.protected):
             by_size[f.size].append(f)
+    same_size = [_drop_hard_links(g) for g in by_size.values() if len(g) > 1]
+    n_check = sum(len(g) for g in same_size)
 
     candidates: list[list[FileEntry]] = []
-    for size, group in by_size.items():
-        if len(group) < 2:
-            continue
+    checked = 0
+    for group in same_size:
         if cancel and cancel.is_set():
             return 0
-        by_sample: dict[str, list[FileEntry]] = defaultdict(list)
-        for f in _drop_hard_links(group):
-            h = _sample_hash(f.path, size)
-            if h:
-                by_sample[h].append(f)
-        candidates += [g for g in by_sample.values() if len(g) > 1]
+        size = group[0].size
+        for g in _split(group, lambda f: _read_at(f.path, (0,))):
+            candidates += _split(g, lambda f: _read_at(f.path, (size // 2, max(0, size - SAMPLE))))
+        checked += len(group)
+        if progress:
+            progress(f"Looking for duplicates: checked {checked:,} of {n_check:,} same-size files")
 
     total = sum(f.size for g in candidates for f in g)
     done = 0
@@ -272,31 +330,108 @@ def mark_duplicates(files: list[FileEntry], cancel: threading.Event | None = Non
         nonlocal done
         done += n
         if progress:
-            progress(done, total)
+            progress(f"Comparing possible duplicates: {human_size(done)} of up to {human_size(total)} read")
 
     marked = 0
     for group in candidates:
-        by_full: dict[str, list[FileEntry]] = defaultdict(list)
-        for f in group:
-            h = _full_hash(f.path, cancel, on_bytes)
+        for dupes in _identical(group, cancel, on_bytes):
             if cancel and cancel.is_set():
                 return marked
-            if h:
-                by_full[h].append(f)
-        for dupes in by_full.values():
-            if len(dupes) < 2:
-                continue
             dupes.sort(key=lambda f: (f.mtime, len(f.path)))
             original = dupes[0]
             for copy in dupes[1:]:
-                copy.duplicate_of = original.path
-                a = copy.assessment
-                if a.verdict in (kb.KEEP, kb.MOVE):
-                    a.verdict = kb.REVIEW
-                    a.reason = (f"Exact duplicate of another file ({os.path.basename(original.path)}). "
-                                "You only need one copy.")
+                _mark_copy(copy, original)
                 marked += 1
     return marked
+
+
+def _mark_copy(copy: FileEntry, original: FileEntry) -> None:
+    a = copy.assessment
+    if copy.pre_dup is None:
+        copy.pre_dup = (a.verdict, a.reason)
+    copy.duplicate_of = original.path
+    a.verdict = kb.REVIEW
+    a.reason = (f"Exact duplicate of another file ({os.path.basename(original.path)}). "
+                "You only need one copy.")
+
+
+def regroup_duplicates(files: list[FileEntry]) -> list[tuple[FileEntry, str]]:
+    """After files were moved or deleted: a copy whose original is gone becomes the new original
+    (getting its own verdict back), so the last copy of something is never labelled 'duplicate'.
+    Returns (file, old_verdict) for every file whose verdict changed."""
+    present = {f.path for f in files}
+    orphans: dict[str, list[FileEntry]] = defaultdict(list)
+    for f in files:
+        if f.duplicate_of and f.duplicate_of not in present:
+            orphans[f.duplicate_of].append(f)
+    changed = []
+    for group in orphans.values():
+        group.sort(key=lambda f: (f.mtime, len(f.path)))
+        heir = group[0]
+        old = heir.verdict
+        heir.duplicate_of = None
+        if heir.pre_dup:
+            heir.assessment.verdict, heir.assessment.reason = heir.pre_dup
+            heir.pre_dup = None
+        if heir.verdict != old:
+            changed.append((heir, old))
+        for copy in group[1:]:
+            _mark_copy(copy, heir)
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Space map index
+# ---------------------------------------------------------------------------
+
+def build_index(result: ScanResult) -> None:
+    """Bytes per verdict for every folder (direct files, and including subfolders)."""
+    # files directly in the scan root have this as their dirname ("C:\\", "\\\\nas\\share\\", "/x")
+    root = result.map_root = os.path.dirname(os.path.join(result.root, "x"))
+    by_dir: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for f in result.files:
+        by_dir[os.path.dirname(f.path)][f.verdict] += f.size
+    breakdown: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    subfolders: dict[str, set[str]] = defaultdict(set)
+    for d, vb in by_dir.items():
+        for v, b in vb.items():
+            breakdown[d][v] += b
+    # roll up bottom-up: longest (deepest) paths first, each folder adds itself to its parent once
+    heap = [(-len(d), d) for d in breakdown if d != root]
+    heapq.heapify(heap)
+    seen = {d for _, d in heap}
+    while heap:
+        _, d = heapq.heappop(heap)
+        parent = os.path.dirname(d)
+        if parent == d or len(parent) < len(root):
+            continue
+        subfolders[parent].add(d)
+        agg = breakdown[parent]
+        for v, b in breakdown[d].items():
+            agg[v] += b
+        if parent != root and parent not in seen:
+            seen.add(parent)
+            heapq.heappush(heap, (-len(parent), parent))
+    result.by_dir, result.breakdown, result.subfolders = by_dir, breakdown, subfolders
+
+
+def index_shift(result: ScanResult, f: FileEntry, old: str | None, new: str | None) -> None:
+    """Move a file's bytes from verdict `old` to `new` (None = removed/added) in the index."""
+    d = os.path.dirname(f.path)
+    for v, sign in ((old, -1), (new, 1)):
+        if v is None:
+            continue
+        if d in result.by_dir:
+            result.by_dir[d][v] = result.by_dir[d].get(v, 0) + sign * f.size
+        x = d
+        while x in result.breakdown:
+            result.breakdown[x][v] = result.breakdown[x].get(v, 0) + sign * f.size
+            if x == result.map_root:
+                break
+            parent = os.path.dirname(x)
+            if parent == x:
+                break
+            x = parent
 
 
 def _drop_hard_links(group: list[FileEntry]) -> list[FileEntry]:

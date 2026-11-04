@@ -335,3 +335,105 @@ def test_treemap_layout_fills_the_area():
         assert abs(sum(w * h for _, _, w, h in rects) - 400 * 300) < 1e-6
         for x, y, w, h in rects:
             assert -1e-6 <= x and x + w <= 400 + 1e-6 and -1e-6 <= y and y + h <= 300 + 1e-6
+
+
+def _three_copies(tree):
+    vids = tree / "Videos"
+    data = os.urandom(2 * MB)
+    for i, name in enumerate(("holiday.mp4", "holiday (1).mp4", "holiday (2).mp4")):
+        (vids / name).write_bytes(data)
+        os.utime(vids / name, (OLD + i, OLD + i))  # holiday.mp4 is the oldest -> the original
+    return scan(str(tree), Settings(move_media_mb=1))
+
+
+def test_deleting_the_original_promotes_a_copy(tree):
+    from file_sorter.scanner import regroup_duplicates
+    res = _three_copies(tree)
+    by_name = {f.name: f for f in res.files}
+    assert by_name["holiday (1).mp4"].duplicate_of == by_name["holiday.mp4"].path
+    # the original is deleted
+    res.files = [f for f in res.files if f.name != "holiday.mp4"]
+    changed = regroup_duplicates(res.files)
+    heir, other = by_name["holiday (1).mp4"], by_name["holiday (2).mp4"]
+    assert heir.duplicate_of is None and heir.verdict == kb.MOVE  # its own verdict is back
+    assert [f for f, _ in changed] == [heir]
+    assert other.duplicate_of == heir.path and other.verdict == kb.REVIEW
+    # and when only one is left, it's not a duplicate of anything
+    res.files = [f for f in res.files if f is not heir]
+    regroup_duplicates(res.files)
+    assert other.duplicate_of is None and other.verdict == kb.MOVE
+
+
+def test_side_by_side_compare(tree, monkeypatch):
+    from file_sorter import scanner
+    big = os.urandom(scanner.CHUNK + MB)
+    (tree / "Videos" / "x.mp4").write_bytes(big)
+    (tree / "Videos" / "x copy.mp4").write_bytes(big)
+    (tree / "Videos" / "x edited.mp4").write_bytes(big[:-10] + b"0123456789")  # differs only at the very end
+    for max_open in (64, 1):  # side by side, and the whole-file-hash fallback for big groups
+        monkeypatch.setattr(scanner, "MAX_OPEN", max_open)
+        res = scan(str(tree), Settings(move_media_mb=1))
+        by_name = {f.name: f for f in res.files}
+        assert {by_name["x.mp4"].duplicate_of, by_name["x copy.mp4"].duplicate_of} - {None}
+        assert by_name["x edited.mp4"].duplicate_of is None
+        assert res.duplicates_checked
+
+
+def test_space_map_index(tree):
+    from file_sorter.scanner import index_shift
+    res = scan(str(tree), Settings(move_media_mb=1), find_duplicates=False)
+    root = res.map_root
+    assert sum(res.breakdown[root].values()) == sum(f.size for f in res.files)
+    videos = os.path.join(str(tree), "Videos")
+    assert videos in res.subfolders[root]
+    f = next(f for f in res.files if f.name == "a.mp4")
+    before = sum(res.breakdown[root].values())
+    index_shift(res, f, f.verdict, None)  # file deleted
+    assert sum(res.breakdown[root].values()) == before - f.size
+    assert sum(res.breakdown[videos].values()) == sum(x.size for x in res.files if x.path.startswith(videos)) - f.size
+
+
+def test_space_map_index_windows_roots(monkeypatch):
+    import ntpath
+    import types
+    from file_sorter import scanner
+    from file_sorter.analysis import Assessment
+    monkeypatch.setattr(scanner, "os", types.SimpleNamespace(path=ntpath))
+    for root, files in (("C:\\", ["C:\\a.txt", "C:\\Users\\me\\b.txt"]),
+                        ("\\\\nas\\share", ["\\\\nas\\share\\a.txt", "\\\\nas\\share\\Films\\b.mkv"])):
+        res = scanner.ScanResult(root=root, files=[
+            scanner.FileEntry(p, 100, 0, 0, Assessment(kb.KEEP, "", "other", "")) for p in files])
+        scanner.build_index(res)
+        assert sum(res.breakdown[res.map_root].values()) == 200, root
+        assert res.subfolders[res.map_root], root
+
+
+def test_unreadable_file_mid_compare_is_skipped(tree, monkeypatch):
+    import builtins
+    from file_sorter import scanner
+    data = os.urandom(2 * MB)
+    for name in ("p.mp4", "p copy.mp4", "p locked.mp4"):
+        (tree / "Videos" / name).write_bytes(data)
+    real_open = builtins.open
+
+    class Locked:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def read(self, n=-1):
+            raise PermissionError("locked by another program")
+
+        def close(self):
+            self.fh.close()
+
+    def fake_open(path, mode="r", *a, **k):
+        fh = real_open(path, mode, *a, **k)
+        return Locked(fh) if str(path).endswith("p locked.mp4") and "b" in mode else fh
+
+    res = scan(str(tree), Settings(move_media_mb=1), find_duplicates=False)
+    monkeypatch.setattr(scanner, "_read_at", lambda path, offsets: b"same")  # get every file to the full compare
+    monkeypatch.setattr(builtins, "open", fake_open)
+    scanner.mark_duplicates(res.files)  # must not raise
+    by_name = {f.name: f for f in res.files}
+    assert by_name["p locked.mp4"].duplicate_of is None
+    assert {by_name["p.mp4"].duplicate_of, by_name["p copy.mp4"].duplicate_of} - {None}

@@ -10,13 +10,11 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from collections import defaultdict
-
 from . import actions, ai
 from . import knowledge as kb
 from . import widgets as W
 from .analysis import Settings, explain, human_size, match_folders, owning_app
-from .scanner import FileEntry, ScanResult, scan
+from .scanner import FileEntry, ScanResult, index_shift, regroup_duplicates, scan
 
 MAX_ROWS = 3000
 
@@ -64,9 +62,6 @@ class App(tk.Tk):
         self.path_var = tk.StringVar(value=default_scan_path())
         self.map_folder: str | None = None      # folder shown in the space map
         self.folder_direct = False              # folder filter: only files directly in it
-        self.by_dir: dict[str, dict[str, int]] = {}
-        self.breakdown: dict[str, dict[str, int]] = {}
-        self.subfolders: dict[str, set[str]] = {}
         self.media_mb_var = tk.IntVar(value=50)
         self.stale_days_var = tk.IntVar(value=365)
         self.search_var = tk.StringVar()
@@ -106,21 +101,22 @@ class App(tk.Tk):
         bar = self._card(self, fill="x", padx=14, pady=(14, 0))
         row = ttk.Frame(bar, style="Card.TFrame")
         row.pack(fill="x")
-        ttk.Label(row, text="Folder or drive", style="CardMuted.TLabel").pack(side="left", padx=(0, 8))
-        entry = ttk.Entry(row, textvariable=self.path_var, width=50)
-        entry.pack(side="left", fill="x", expand=True)
-        entry.bind("<Return>", lambda e: self.start_scan())
-        ttk.Button(row, text="Browse...", command=self.browse).pack(side="left", padx=(6, 0))
-        self.drive_menu = ttk.Menubutton(row, text="Drives")
-        self.drive_menu.pack(side="left", padx=(6, 0))
-        self._fill_drive_menu()
-        self.scan_btn = ttk.Button(row, text="Scan", style="Primary.TButton", command=self.start_scan)
-        self.scan_btn.pack(side="left", padx=(14, 0))
+        # buttons are packed from the right first, so on a narrow screen the path box shrinks instead
+        self.stop_btn = ttk.Button(row, text="Stop", command=self.stop_scan, state="disabled")
+        self.stop_btn.pack(side="right", padx=(6, 0))
         self.dupe_btn = ttk.Button(row, text="Scan + find duplicates",
                                    command=lambda: self.start_scan(find_dupes=True))
-        self.dupe_btn.pack(side="left", padx=(6, 0))
-        self.stop_btn = ttk.Button(row, text="Stop", command=self.stop_scan, state="disabled")
-        self.stop_btn.pack(side="left", padx=(6, 0))
+        self.dupe_btn.pack(side="right", padx=(6, 0))
+        self.scan_btn = ttk.Button(row, text="Scan", style="Primary.TButton", command=self.start_scan)
+        self.scan_btn.pack(side="right", padx=(14, 0))
+        self.drive_menu = ttk.Menubutton(row, text="Drives")
+        self.drive_menu.pack(side="right", padx=(6, 0))
+        self._fill_drive_menu()
+        ttk.Button(row, text="Browse...", command=self.browse).pack(side="right", padx=(6, 0))
+        ttk.Label(row, text="Folder or drive", style="CardMuted.TLabel").pack(side="left", padx=(0, 8))
+        entry = ttk.Entry(row, textvariable=self.path_var, width=20)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda e: self.start_scan())
         opts = ttk.Frame(bar, style="Card.TFrame")
         opts.pack(fill="x", pady=(8, 0))
         ttk.Label(opts, text="Suggest moving photos, videos and archives bigger than",
@@ -128,8 +124,7 @@ class App(tk.Tk):
         ttk.Spinbox(opts, from_=1, to=100000, width=6, textvariable=self.media_mb_var).pack(side="left", padx=4)
         ttk.Label(opts, text="MB, and files not used for", style="CardMuted.TLabel").pack(side="left")
         ttk.Spinbox(opts, from_=30, to=10000, width=6, textvariable=self.stale_days_var).pack(side="left", padx=4)
-        ttk.Label(opts, text="days.   'Scan' skips duplicates so it's fast; "
-                             "'Scan + find duplicates' also compares files.",
+        ttk.Label(opts, text="days.   'Scan' is quick; 'Scan + find duplicates' also compares files.",
                   style="CardMuted.TLabel").pack(side="left")
 
         # --- summary: headline, cards, storage bar
@@ -184,8 +179,8 @@ class App(tk.Tk):
         self.up_btn.pack(side="left")
         self.map_path = ttk.Label(mbar, text="", style="H2.TLabel")
         self.map_path.pack(side="left", padx=10)
-        legend = ttk.Frame(mbar, style="Card.TFrame")
-        legend.pack(side="right")
+        legend = ttk.Frame(map_tab, style="Card.TFrame")
+        legend.pack(fill="x", pady=(0, 6))
         for v in kb.VERDICTS:
             tk.Label(legend, text="\u25a0", fg=W.MAP_FILL[v], bg=W.SURFACE, font=f["h2"]).pack(side="left")
             tk.Label(legend, text=kb.SHORT[v] + "  ", fg=W.MUTED, bg=W.SURFACE, font=f["small"]).pack(side="left")
@@ -317,7 +312,7 @@ class App(tk.Tk):
     def _update_drives_label(self) -> None:
         for w in self.drive_box.winfo_children():
             w.destroy()
-        for root, free, total in actions.list_drives()[:4]:
+        for root, free, total in actions.list_drives()[:3]:
             W.DriveMeter(self.drive_box, root, free, total).pack(side="left", padx=(16, 0))
 
     def _spin(self, on: bool) -> None:
@@ -376,7 +371,7 @@ class App(tk.Tk):
             self.path_var.set(d)
 
     def start_scan(self, find_dupes: bool = False) -> None:
-        if self.scan_thread and self.scan_thread.is_alive():
+        if self.busy or (self.scan_thread and self.scan_thread.is_alive()):
             return
         root = self.path_var.get().strip()
         if len(root) == 2 and root[1] == ":":
@@ -457,15 +452,13 @@ class App(tk.Tk):
             f"{state}: {plural(len(res.files), 'file')} in {res.seconds:.0f}s. "
             f"You could free up to {human_size(removable)} by deleting and "
             f"{human_size(movable)} by moving." + (f"  ({res.errors:,} items couldn't be read)" if res.errors else ""))
-        self.map_folder = res.root
+        self.map_folder = res.map_root
         self.refresh_all()
         self.tabs.select(self.map_tab)
 
     # ------------------------------------------------------------------ lists
     def refresh_all(self) -> None:
-        self._index()
-        self.refresh_cards()
-        self.refresh_files()
+        self.refresh_files()  # also refreshes the cards
         self.refresh_folders()
         self.draw_map()
 
@@ -490,8 +483,7 @@ class App(tk.Tk):
     def set_filter(self, verdict: str) -> None:
         self.show_var.set(verdict)
         self.tabs.select(self.files_tab)
-        self.refresh_cards()
-        self.refresh_files()
+        self.refresh_files()  # also refreshes the cards
 
     def _debounced_refresh(self) -> None:
         if hasattr(self, "_debounce"):
@@ -556,10 +548,14 @@ class App(tk.Tk):
                                      human_size(f.size), f"{W.ICONS[f.verdict]}  {label}", f.assessment.kind_label,
                                      used, os.path.dirname(f.path)))
         if not items and self.show_var.get() == DUPES and self.result:
-            self._write_details([("No duplicates found\n", "title"),
-                                 ("To look for duplicates, press 'Scan + find duplicates' at the top. "
-                                  "Only personal files of 1 MB or more (photos, videos, documents, archives...) "
-                                  "are compared.\n", "")])
+            if not self.result.duplicates_checked:
+                why = "This scan didn't look for duplicates. Press 'Scan + find duplicates' at the top."
+            elif self.search_var.get().strip() or self.folder_filter:
+                why = "None match your search or folder filter. Clear them to see all duplicates."
+            else:
+                why = ("No identical copies were found. Only personal files of 1 MB or more "
+                       "(photos, videos, documents, archives...) are compared.")
+            self._write_details([("No duplicates to show\n", "title"), (why + "\n", "")])
         total = sum(f.size for f in items)
         extra = f" (showing the first {MAX_ROWS:,})" if len(items) > MAX_ROWS else ""
         self.tabs.tab(self.files_tab, text=f"  Files: {len(items):,} ({human_size(total)}){extra}  ")
@@ -573,7 +569,10 @@ class App(tk.Tk):
         self.refresh_files()
 
     def select_all(self) -> None:
-        self.tree.selection_set(self.tree.get_children())
+        if self.show_var.get() == DUPES:  # only the extra copies, never the originals
+            self.tree.selection_set([i for i, f in self.rows.items() if f.duplicate_of])
+        else:
+            self.tree.selection_set(self.tree.get_children())
 
     def refresh_folders(self) -> None:
         self.ftree.delete(*self.ftree.get_children())
@@ -616,48 +615,27 @@ class App(tk.Tk):
         self.refresh_files()
 
     # ------------------------------------------------------------------ space map
-    def _index(self) -> None:
-        """Per-folder byte totals by verdict, and each folder's subfolders (for the space map)."""
-        self.by_dir, self.breakdown, self.subfolders = {}, {}, {}
-        if not self.result:
-            return
-        root = self.result.root
-        by_dir: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for f in self.result.files:
-            by_dir[os.path.dirname(f.path)][f.verdict] += f.size
-        breakdown: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        children: dict[str, set[str]] = defaultdict(set)
-        for d, vb in by_dir.items():
-            x = d
-            while True:
-                agg = breakdown[x]
-                for v, b in vb.items():
-                    agg[v] += b
-                if x == root or len(x) <= len(root):
-                    break
-                parent = os.path.dirname(x)
-                if parent == x:
-                    break
-                children[parent].add(x)
-                x = parent
-        self.by_dir, self.breakdown, self.subfolders = by_dir, breakdown, children
-
     def draw_map(self) -> None:
-        if not self.result:
+        r = self.result
+        if not r:
             return
-        folder = self.map_folder or self.result.root
-        if folder not in self.breakdown:
-            folder = self.map_folder = self.result.root
-        items = [(os.path.basename(c) or c, c, dict(self.breakdown[c]), True) for c in self.subfolders.get(folder, ())]
-        if self.by_dir.get(folder):
-            items.append(("Files in this folder", folder, dict(self.by_dir[folder]), False))
-        self.space_map.show(items, "This folder is empty.")
-        total = sum(self.breakdown.get(folder, {}).values())
+        folder = self.map_folder or r.map_root
+        # if everything in this folder was moved/deleted, go up to the nearest folder that still has files
+        while folder != r.map_root and sum(r.breakdown.get(folder, {}).values()) <= 0:
+            parent = os.path.dirname(folder)
+            folder = r.map_root if parent == folder or len(parent) < len(r.map_root) else parent
+        self.map_folder = folder
+        items = [(os.path.basename(c) or c, c, dict(r.breakdown[c]), True) for c in r.subfolders.get(folder, ())]
+        if r.by_dir.get(folder):
+            items.append(("Files in this folder", folder, dict(r.by_dir[folder]), False))
+        self.space_map.show(items, "Only empty (0-byte) files here." if r.folder_counts.get(folder)
+                        else "This folder is empty.")
+        total = sum(r.breakdown.get(folder, {}).values())
         self.map_path.configure(text=f"{folder}   ({human_size(total)})")
-        self.up_btn.configure(state="normal" if folder != self.result.root else "disabled")
+        self.up_btn.configure(state="normal" if folder != r.map_root else "disabled")
 
     def map_open(self, path: str, is_folder: bool) -> None:
-        if is_folder and self.subfolders.get(path):
+        if is_folder and self.result and self.result.subfolders.get(path):
             self.map_folder = path
             self.draw_map()
         else:  # a folder without subfolders, or the loose files of this folder: list them
@@ -665,7 +643,7 @@ class App(tk.Tk):
             self.show_folder_files(path, direct=not is_folder)
 
     def map_up(self) -> None:
-        if self.result and self.map_folder and self.map_folder != self.result.root:
+        if self.result and self.map_folder and self.map_folder != self.result.map_root:
             self.map_folder = os.path.dirname(self.map_folder)
             self.draw_map()
 
@@ -775,8 +753,8 @@ class App(tk.Tk):
                 messagebox.showerror("File Sorter", str(e))
 
     def _guard_system(self, entries: list[FileEntry], action: str) -> list[FileEntry] | None:
-        if self.busy:
-            messagebox.showinfo("File Sorter", "Please wait until the current move/delete has finished.")
+        if self.busy or (self.scan_thread and self.scan_thread.is_alive()):
+            messagebox.showinfo("File Sorter", "Please wait until the current scan or move/delete has finished.")
             return None
         system = [f for f in entries if f.verdict == kb.SYSTEM]
         if system:
@@ -792,9 +770,29 @@ class App(tk.Tk):
             return ok
         return entries
 
+    def _every_copy_selected(self, entries: list[FileEntry]) -> str | None:
+        """Name of a file whose every copy (original included) is in `entries`, if any."""
+        if not self.result:
+            return None
+        groups: dict[str, set[str]] = {}
+        for f in self.result.files:
+            if f.duplicate_of:
+                groups.setdefault(f.duplicate_of, {f.duplicate_of}).add(f.path)
+        chosen = {f.path for f in entries}
+        for original, members in groups.items():
+            if members <= chosen:
+                return os.path.basename(original)
+        return None
+
     def delete_selected(self) -> None:
         entries = self._guard_system(self.selected_entries(), "delete")
         if not entries:
+            return
+        lost = self._every_copy_selected(entries)
+        if lost:
+            messagebox.showwarning("File Sorter",
+                                   f"You selected every copy of '{lost}'. Deleting them all would lose that "
+                                   "file completely.\n\nUnselect one copy (the one you want to keep) and try again.")
             return
         total = sum(f.size for f in entries)
         risky = [f for f in entries if f.verdict in (kb.KEEP, kb.MOVE)]
@@ -886,6 +884,11 @@ class App(tk.Tk):
         if self.result:
             gone = [f for f in self.result.files if f.path in done]
             self.result.files = [f for f in self.result.files if f.path not in done]
+            for f in gone:
+                index_shift(self.result, f, f.verdict, None)
+            # a copy whose original is gone is no longer a duplicate
+            for f, old in regroup_duplicates(self.result.files):
+                index_shift(self.result, f, old, f.verdict)
             for f in gone:  # keep the "Biggest folders" numbers right
                 d = os.path.dirname(f.path)
                 while d in self.result.folder_sizes:
