@@ -26,7 +26,15 @@ SKIP_SELF = {os.path.normcase(os.path.realpath(getattr(sys, "_MEIPASS")))} if ge
 # Windows file attributes
 REPARSE_POINT = 0x400  # junctions and other links (is_junction() only exists on Python 3.12+)
 ONLINE_ONLY = 0x400000 | 0x40000 | 0x1000  # OneDrive/cloud placeholders: reading them downloads them
-CLOUD_MANAGED = 0x80000 | 0x100000 | 0x400  # pinned / unpinned / reparse point: a cloud app keeps it in sync
+CLOUD_MANAGED = 0x80000 | 0x100000  # pinned / unpinned: a cloud app keeps it in sync
+
+
+def _is_cloud_file(st) -> bool:
+    attrs = getattr(st, "st_file_attributes", 0)
+    if attrs & CLOUD_MANAGED:
+        return True
+    # a reparse point counts only with a cloud-files tag (IO_REPARSE_TAG_CLOUD*), not compressed files etc.
+    return bool(attrs & 0x400) and (getattr(st, "st_reparse_tag", 0) & 0xFFFF0FFF) == 0x9000001A
 
 # Folder names that hold a program's DLLs one or two levels below its real install folder.
 BIN_DIRS = {"bin", "bin32", "bin64", "x64", "x86", "win64", "win32", "binaries", "lib", "plugins"}
@@ -135,7 +143,8 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
             result.cancelled = True
             break
         folder = stack.pop()
-        if folder in SKIP_LINUX_ROOTS or (SKIP_SELF and os.path.normcase(os.path.realpath(folder)) in SKIP_SELF):
+        if folder in SKIP_LINUX_ROOTS or (SKIP_SELF and os.path.basename(folder).lower().startswith("_mei")
+                                          and os.path.normcase(os.path.realpath(folder)) in SKIP_SELF):
             continue
         subdirs, entries, impure, errors = _list_dir(folder)
         stack.extend(subdirs)
@@ -153,7 +162,7 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
                 a.verdict = kb.KEEP
                 a.reason = ("Online-only cloud file: it's listed here but stored in the cloud, so it "
                             "takes (almost) no space on this drive.")
-            if getattr(st, "st_file_attributes", 0) & CLOUD_MANAGED and not a.warnings:
+            if _is_cloud_file(st) and not a.warnings:
                 a.cloud = True
                 a.warnings.append("This file is kept in sync by a cloud app: deleting or moving it here "
                                   "also removes it from the cloud and your other devices.")

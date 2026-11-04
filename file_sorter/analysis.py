@@ -289,7 +289,7 @@ CLOUD_ROOTS = _cloud_roots()
 
 def _on_system_drive(path: str) -> bool:
     m = re.match(r"^([A-Za-z]):", path)
-    return bool(m) and m.group(1).upper() == os.environ.get("SystemDrive", "C:")[0].upper()
+    return bool(m) and m.group(1).upper() == (os.environ.get("SystemDrive") or "C:")[0].upper()
 
 
 def is_cloud_path(path: str) -> bool:

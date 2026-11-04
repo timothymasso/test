@@ -876,3 +876,20 @@ def test_leftovers_never_override_never_touch(tree):
     leftover_app_data(res.files, [Program("Something Else")])
     f = next(f for f in res.files if f.name == "config.json")
     assert f.verdict == kb.SYSTEM and f.assessment.protected
+
+
+
+def test_permanent_delete_never_uses_the_recycle_bin(tree, monkeypatch):
+    from file_sorter.scanner import whole_folders
+    t = _temp_tree(tree)
+    res = scan(str(tree), find_duplicates=False)
+    singles, folders = whole_folders([f.path for f in res.files if "{guid}" in f.path], res)
+    (t / "new.txt").write_text("x")  # folder changed: its files go one by one
+    calls = _fake_trash(monkeypatch)
+    report = actions.delete_files(singles, permanently=True, folders=folders)
+    assert calls == [] and len(report.done) == 2 and (t / "new.txt").exists()
+
+
+def test_system_drive_setting_may_be_empty(monkeypatch):
+    monkeypatch.setenv("SystemDrive", "")
+    assert a("C:\\AMD\\x\\y.inf").verdict in kb.VERDICTS

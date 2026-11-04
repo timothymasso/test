@@ -84,13 +84,17 @@ def _place(tmp: str, dst: str) -> None:
         return
     try:
         os.link(tmp, dst)  # refuses to overwrite
-        os.remove(tmp)
     except FileExistsError:
         raise
     except OSError:  # drives without hard links (FAT/exFAT USB sticks)
         if os.path.lexists(dst):
             raise FileExistsError(f"{dst} already exists; nothing was overwritten")
         os.replace(tmp, dst)
+        return
+    try:
+        os.remove(tmp)  # dst is in place; the extra name is just tidied up
+    except OSError:
+        pass
 
 
 def _log(log_path: str, src: str, dst: str, size: int) -> str | None:
@@ -313,25 +317,26 @@ def delete_files(paths: list[str], permanently: bool = False, progress=None,
                 checked.append((unit, members))
         batch = checked
         failed: list[tuple[str, str]] = []
-        try:
-            if len(batch) == 1:
-                remove(*batch[0])
-            else:
-                _send2trash([u for u, _ in batch])
-        except Exception as batch_error:  # noqa: BLE001 - retry item by item to find the bad one
+
+        def one_at_a_time() -> None:
             for unit, members in batch:
-                if not os.path.lexists(unit):  # the failed batch already removed this one
+                if not os.path.lexists(unit):  # a failed batch call already removed this one
                     continue
                 try:
-                    if len(batch) > 1:
-                        remove(unit, members)
-                    else:
-                        raise batch_error
+                    remove(unit, members)
                 except Exception as e:  # noqa: BLE001
                     if unit in folders:  # one locked file: still delete the rest of the folder
-                        failed += remove_one_by_one(members)
+                        failed.extend(remove_one_by_one(members))
                     else:
                         failed.append((unit, str(e)))
+
+        if permanently or len(batch) == 1:  # a permanent delete must never land in the Recycle Bin
+            one_at_a_time()
+        else:
+            try:
+                _send2trash([u for u, _ in batch])
+            except Exception:  # noqa: BLE001 - retry item by item to find the bad one
+                one_at_a_time()
         bad = {p for p, _ in failed}
         for unit, members in batch:
             for m in members:
