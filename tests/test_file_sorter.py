@@ -323,3 +323,15 @@ def test_lookalikes_are_not_duplicates_and_stop_works(tree):
     stop = threading.Event()
     stop.set()
     assert mark_duplicates(res.files, stop) == 0
+
+
+def test_treemap_layout_fills_the_area():
+    from file_sorter.treemap import squarify
+    for sizes in ([600.0], [300.0, 200.0, 100.0], [500.0, 1.0, 0.0, 99.0], [1.0] * 50):
+        sizes = sorted(sizes, reverse=True)
+        total = sum(sizes)
+        rects = squarify([s / total * 400 * 300 for s in sizes], 0, 0, 400, 300)
+        assert len(rects) == len([s for s in sizes if s > 0])
+        assert abs(sum(w * h for _, _, w, h in rects) - 400 * 300) < 1e-6
+        for x, y, w, h in rects:
+            assert -1e-6 <= x and x + w <= 400 + 1e-6 and -1e-6 <= y and y + h <= 300 + 1e-6

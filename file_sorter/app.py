@@ -396,6 +396,7 @@ class App(tk.Tk):
         self._spin(True)
         self.status_var.set(f"Scanning {root} ...")
         self.folder_filter = None
+        self.folder_direct = False
         self.folder_chip.pack_forget()
 
         def work() -> None:
@@ -518,7 +519,7 @@ class App(tk.Tk):
                 continue
             if prefix and not f.path.startswith(prefix):
                 continue
-            if self.folder_direct and os.path.dirname(f.path) != self.folder_filter:
+            if prefix and self.folder_direct and os.path.dirname(f.path) != self.folder_filter:
                 continue
             if q and q not in f.path.lower():
                 continue

@@ -9,6 +9,7 @@ from tkinter import ttk
 
 from . import knowledge as kb
 from .analysis import human_size
+from .treemap import squarify
 
 # --------------------------------------------------------------------------- theme
 BG = "#f3f4f6"
@@ -145,7 +146,6 @@ class StorageBar(tk.Canvas):
         self.delete("all")
         w, h = self.winfo_width(), int(self["height"])
         total = sum(self.totals.values())
-        r = 6
         if not total or w < 20:
             self.create_rectangle(0, 4, w, h - 4, fill=BORDER, outline="")
             return
@@ -164,9 +164,6 @@ class StorageBar(tk.Canvas):
             self.tag_bind(tag, "<Enter>", lambda e: self.configure(cursor="hand2"))
             self.tag_bind(tag, "<Leave>", lambda e: self.configure(cursor=""))
             x += part
-        # rounded ends
-        for cx in (0, w):
-            self.create_rectangle(cx - r if cx else 0, 0, cx + r if not cx else w, 4, fill=SURFACE, outline="")
 
 
 # --------------------------------------------------------------------------- drive meters
@@ -186,41 +183,6 @@ class DriveMeter(tk.Canvas):
 
 
 # --------------------------------------------------------------------------- space map
-def squarify(values: list[float], x: float, y: float, w: float, h: float) -> list[tuple[float, float, float, float]]:
-    """Squarified treemap layout. values must be sorted largest first and sum to w*h."""
-    rects: list[tuple[float, float, float, float]] = []
-    vals = [v for v in values if v > 0]
-
-    def worst(row: list[float], side: float) -> float:
-        s = sum(row)
-        return max(max(side * side * v / (s * s), (s * s) / (side * side * v)) for v in row)
-
-    while vals:
-        side = min(w, h)
-        if side <= 0:
-            break
-        row = [vals[0]]
-        i = 1
-        while i < len(vals) and worst(row + [vals[i]], side) <= worst(row, side):
-            row.append(vals[i])
-            i += 1
-        s = sum(row)
-        if w >= h:
-            rw, yy = s / h, y
-            for v in row:
-                rects.append((x, yy, rw, v / rw))
-                yy += v / rw
-            x, w = x + rw, w - rw
-        else:
-            rh, xx = s / w, x
-            for v in row:
-                rects.append((xx, y, v / rh, rh))
-                xx += v / rh
-            y, h = y + rh, h - rh
-        vals = vals[i:]
-    return rects
-
-
 class SpaceMap(tk.Canvas):
     """Treemap of a folder: each box is a subfolder, sized by space used and striped by verdict.
 
