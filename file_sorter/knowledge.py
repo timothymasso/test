@@ -252,21 +252,32 @@ EXTENSIONS.update({
     ".mca": ("game_data", "Minecraft world region file."), ".ico": ("image", "Icon image."),
 })
 
-# Name patterns for well-known files (checked after KNOWN_FILES). (pattern, what, verdict, why)
-KNOWN_PATTERNS: list[tuple[str, str, str, str]] = [
-    ("thumbcache_*.db", "Windows thumbnail cache.", "Safe to delete", "Windows rebuilds it (may need a restart)."),
-    ("iconcache_*.db", "Windows icon cache.", "Safe to delete", "Windows rebuilds it (may need a restart)."),
+# Name patterns for well-known files (checked after KNOWN_FILES; 're:' means a regular expression):
+# (pattern, what, verdict, why, max size in bytes or None, folder prefixes it must be in or None).
+# Patterns that mark files "Safe to delete" are kept narrow: one-click Clean up acts on them.
+_WIN_LOGS = ("^/windows/", "^/$windows.~bt/", "^/$windows.~ws/")
+KNOWN_PATTERNS: list[tuple[str, str, str, str, int | None, tuple[str, ...] | None]] = [
+    ("thumbcache_*.db", "Windows thumbnail cache.", "Safe to delete", "Windows rebuilds it (may need a restart).",
+     None, ("/appdata/local/microsoft/windows/explorer/",)),
+    ("iconcache_*.db", "Windows icon cache.", "Safe to delete", "Windows rebuilds it (may need a restart).",
+     None, ("/appdata/local/microsoft/windows/explorer/",)),
     ("*.dmp", "Crash dump: a memory snapshot saved when a program crashed.", "Safe to delete",
-     "Only useful for debugging an old crash."),
-    ("cbs*.log", "Windows component servicing log.", "Safe to delete", "Only useful for troubleshooting Windows Update."),
-    ("dism*.log", "Windows image servicing log.", "Safe to delete", "Only useful for troubleshooting."),
-    ("setupact.log", "Windows setup log.", "Safe to delete", "Only useful for troubleshooting a past Windows upgrade."),
-    ("setuperr.log", "Windows setup error log.", "Safe to delete", "Only useful for troubleshooting a past Windows upgrade."),
+     "Only useful for debugging an old crash.", None, None),
+    ("cbs*.log", "Windows component servicing log.", "Safe to delete", "Only useful for troubleshooting Windows "
+     "Update.", None, _WIN_LOGS),
+    ("dism*.log", "Windows image servicing log.", "Safe to delete", "Only useful for troubleshooting.", None, _WIN_LOGS),
+    ("setupact.log", "Windows setup log.", "Safe to delete", "Only useful for troubleshooting a past Windows upgrade.",
+     None, _WIN_LOGS),
+    ("setuperr.log", "Windows setup error log.", "Safe to delete", "Only useful for troubleshooting a past Windows "
+     "upgrade.", None, _WIN_LOGS),
+    # real Office lock files are ~160 bytes; anything bigger named like one is somebody's real file
     ("~$*", "Office lock file: Word/Excel/PowerPoint create it while a document is open.", "Safe to delete",
-     "Left over if Office crashed. Delete it once the document is closed."),
-    ("*.~*", "Temporary copy made while a program was saving.", "Safe to delete", "A leftover from saving."),
-    ("npm-debug.log*", "npm error log.", "Safe to delete", "Only useful for debugging that one error."),
-    ("hs_err_pid*.log", "Java crash log.", "Safe to delete", "Only useful for debugging an old crash."),
+     "Left over if Office crashed. Delete it once the document is closed.", 4096, None),
+    # only when the LAST extension starts with ~ (report.~tmp), never 'Thesis.~final.docx'
+    (r"re:.*\.~[^.]*", "Temporary copy made while a program was saving.", "Safe to delete",
+     "A leftover from saving.", None, None),
+    ("npm-debug.log*", "npm error log.", "Safe to delete", "Only useful for debugging that one error.", None, None),
+    ("hs_err_pid*.log", "Java crash log.", "Safe to delete", "Only useful for debugging an old crash.", None, None),
 ]
 
 # ---------------------------------------------------------------------------
@@ -372,6 +383,9 @@ FOLDER_RULES: list[tuple[str, str, str, str, str]] = [
     # --- more Windows leftovers and big hidden space users
     ("^/windows/logs/", "Windows logs", "Diagnostic logs Windows keeps about updates and setup. Can be several GB.",
      DELETE, "Only useful for troubleshooting. Files Windows is still writing to will be skipped."),
+    ("^/windows/serviceprofiles/networkservice/appdata/local/microsoft/windows/deliveryoptimization/cache/",
+     "Delivery Optimization cache", "Pieces of Windows updates kept to share with other PCs.", DELETE,
+     "Safe to clear. If some files refuse, use Disk Cleanup -> 'Delivery Optimization Files'."),
     ("^/programdata/microsoft/windows/deliveryoptimization/", "Delivery Optimization cache",
      "Pieces of Windows updates kept to share with other PCs.", DELETE,
      "Safe to clear. If some files refuse, use Disk Cleanup -> 'Delivery Optimization Files'."),
@@ -413,7 +427,8 @@ FOLDER_RULES: list[tuple[str, str, str, str, str]] = [
      "Adobe rebuilds it when needed."),
     ("/appdata/local/squirreltemp/", "App installer leftovers", "Temporary files from installing Electron apps "
      "(Discord, Teams, Slack...).", DELETE, "Not needed after the install finished."),
-    ("/onedrive/logs/", "OneDrive logs", "OneDrive's diagnostic logs.", DELETE, "Only useful for troubleshooting."),
+    ("/appdata/local/microsoft/onedrive/logs/", "OneDrive logs", "OneDrive's diagnostic logs.", DELETE,
+     "Only useful for troubleshooting."),
     ("/library/developer/xcode/deriveddata/", "Xcode build files", "Intermediate files Xcode creates when building "
      "apps.", DELETE, "Xcode rebuilds them."),
     ("/library/developer/xcode/ios devicesupport/", "Xcode device support", "Debug files for iOS versions of "
@@ -421,8 +436,6 @@ FOLDER_RULES: list[tuple[str, str, str, str, str]] = [
     ("/.cargo/registry/", "Rust package cache", "Downloaded Rust libraries.", DELETE, "Re-downloaded when needed."),
     ("/go/pkg/mod/", "Go module cache", "Downloaded Go libraries.", REVIEW, "Re-downloaded when needed "
      "('go clean -modcache')."),
-    ("/appdata/local/microsoft/windows/inetcache/", "Internet cache", "Cached web content.", DELETE,
-     "Rebuilt automatically."),
     # --- operating system / installed programs (anchored to the drive root)
     ("^/windows/", "Windows", "The Windows operating system.", SYSTEM,
      "Never delete or move files here by hand. Use Disk Cleanup for safe cleanup."),

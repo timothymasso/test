@@ -15,7 +15,8 @@ from . import knowledge as kb
 from . import widgets as W
 from .analysis import Settings, explain, human_size, match_folders, owning_app
 from .groups import Group, build_groups
-from .scanner import FileEntry, ScanResult, index_shift, regroup_duplicates, scan
+from .prefs import Prefs, is_inside
+from .scanner import FileEntry, ScanResult, index_shift, regroup_duplicates, scan, whole_folders
 
 MAX_ROWS = 3000
 
@@ -60,14 +61,15 @@ class App(tk.Tk):
         self.current: FileEntry | None = None
         self.busy = False  # a move/delete is running
 
-        self.path_var = tk.StringVar(value=default_scan_path())
+        self.prefs = Prefs.load()
+        self.path_var = tk.StringVar(value=self.prefs.last_folder or default_scan_path())
         self.map_folder: str | None = None      # folder shown in the space map
         self.folder_direct = False              # folder filter: only files directly in it
         self.groups: list[Group] = []
         self.group_rows: dict[str, Group] = {}   # groups tab: group row id -> group
         self.gfile_rows: dict[str, FileEntry] = {}  # groups tab: file row id -> file
-        self.media_mb_var = tk.IntVar(value=50)
-        self.stale_days_var = tk.IntVar(value=365)
+        self.media_mb_var = tk.IntVar(value=self.prefs.move_media_mb)
+        self.stale_days_var = tk.IntVar(value=self.prefs.stale_days)
         self.search_var = tk.StringVar()
         self.show_var = tk.StringVar(value=ALL)
         self.status_var = tk.StringVar(value="Pick a folder or drive and press Scan.")
@@ -99,6 +101,11 @@ class App(tk.Tk):
                  bg=W.HEADER, fg="#9ca3af", font=f["base"]).pack(side="left", pady=(5, 0))
         self.drive_box = tk.Frame(header, background=W.HEADER)
         self.drive_box.pack(side="right")
+        tools = tk.Menubutton(header, text="Tools \u25be", bg="#1f2937", fg="white", activebackground="#374151",
+                              activeforeground="white", relief="flat", padx=12, pady=4, font=f["bold"],
+                              cursor="hand2")
+        tools.pack(side="right", padx=(0, 16))
+        tools["menu"] = self._tools_menu(tools)
         self._update_drives_label()
 
         # --- scan bar
@@ -140,6 +147,9 @@ class App(tk.Tk):
         self.cleanup_btn.pack(side="right")
         self.headline = ttk.Label(hrow, text="Scan a folder to see where your space goes.", style="H2.TLabel")
         self.headline.pack(side="left", anchor="w")
+        self.freed_label = ttk.Label(hrow, text="", style="CardMuted.TLabel")
+        self.freed_label.pack(side="right", padx=12)
+        self._show_freed()
         cards = ttk.Frame(summary, style="Card.TFrame")
         cards.pack(fill="x", pady=(8, 6))
         self.card_widgets: dict[str, tuple] = {}
@@ -286,6 +296,16 @@ class App(tk.Tk):
         self.ftree.bind("<<TreeviewSelect>>", lambda e: self.on_folder_select())
         self.ftree.bind("<Double-1>", lambda e: self.drill_into_folder())
 
+        self.tabs.bind("<<NotebookTabChanged>>", lambda e: self._tab_changed())
+        for tree in (self.tree, self.gtree, self.ftree):
+            tree.bind("<Button-3>", lambda e, t=tree: self._context_menu(e, t))
+            tree.bind("<Button-2>" if sys.platform == "darwin" else "<Control-Button-1>",
+                      lambda e, t=tree: self._context_menu(e, t))
+        self.bind_all("<Control-f>", lambda e: self._focus_search(search))
+        self.bind_all("<F5>", lambda e: self.start_scan())
+        self.tree.bind("<Control-a>", lambda e: (self.select_all(), "break")[1])
+        self.bind_all("<Escape>", lambda e: self._clear_selection())
+
         # details panel: verdict banner, text, actions
         self.badge = tk.Frame(right, background=W.BG, padx=14, pady=8)
         self.badge_icon = tk.Label(self.badge, text="", bg=W.BG, fg="white", font=f["big"], width=2)
@@ -416,13 +436,16 @@ class App(tk.Tk):
             messagebox.showerror("File Sorter", f"'{root}' isn't a folder I can open.")
             return
         try:
-            settings = Settings(move_media_mb=max(1, int(self.media_mb_var.get())),
-                                stale_days=max(1, int(self.stale_days_var.get())))
+            media_mb, stale = max(1, int(self.media_mb_var.get())), max(1, int(self.stale_days_var.get()))
         except (tk.TclError, ValueError):
-            settings = Settings()
+            media_mb, stale = 50, 365
+        settings = Settings(move_media_mb=media_mb, stale_days=stale, never_touch=tuple(self.prefs.never_touch))
+        self.prefs.last_folder, self.prefs.move_media_mb, self.prefs.stale_days = root, media_mb, stale
+        self.prefs.save()
         self.cancel.clear()
         self.scan_btn.configure(state="disabled")
         self.dupe_btn.configure(state="disabled")
+        self.cleanup_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self._spin(True)
         self.status_var.set(f"Scanning {root} ...")
@@ -435,7 +458,8 @@ class App(tk.Tk):
                 self.events.put(("progress", n, b, folder))
             try:
                 res = scan(root, settings, find_dupes, self.cancel, progress)
-                self.events.put(("done", res))
+                self.events.put(("progress", len(res.files), 0, "Grouping files..."))
+                self.events.put(("done", res, build_groups(res.files)))  # grouping off the UI thread too
             except Exception as e:  # noqa: BLE001
                 self.events.put(("error", str(e)))
 
@@ -456,6 +480,7 @@ class App(tk.Tk):
                     short = folder if len(folder) < 80 else "..." + folder[-77:]
                     self.status_var.set(f"Scanned {n:,} files ({human_size(b)})   {short}")
                 elif kind == "done":
+                    self.groups = ev[2]
                     self._scan_finished(ev[1])
                 elif kind == "error":
                     self._scan_stopped()
@@ -465,7 +490,7 @@ class App(tk.Tk):
                 elif kind == "status":
                     self.status_var.set(ev[1])
                 elif kind == "action_done":
-                    self._after_action(ev[1], ev[2])
+                    self._after_action(*ev[1:])
         except queue.Empty:
             pass
         finally:
@@ -501,14 +526,18 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ groups
     def refresh_groups(self) -> None:
+        """Show self.groups (built off the UI thread after each scan or move/delete)."""
         self.gtree.delete(*self.gtree.get_children())
         self.group_rows, self.gfile_rows = {}, {}
-        self.groups = build_groups(self.result.files) if self.result else []
+        if not self.result:
+            self.groups = []
         for i, g in enumerate(self.groups):
             iid = f"g{i}"
             self.group_rows[iid] = g
             if g.deletable:
                 action = f"\u2713 Free {human_size(g.deletable)}"
+            elif g.key == "dupes" or g.review:
+                action = f"? Check {human_size(g.review)}"
             elif g.movable:
                 action = f"\u2192 Move {human_size(g.movable)}"
             else:
@@ -535,9 +564,15 @@ class App(tk.Tk):
                               text=f"   ... and {len(files) - 300:,} smaller files (Delete/Move still include them)")
 
     def _group_files(self, g: Group, action: str) -> list[FileEntry]:
-        """Which files of a group an action applies to: the ones suggested for it, else all of them."""
-        wanted = {"delete": (kb.DELETE, kb.REVIEW), "move": (kb.MOVE,)}.get(action, ())
-        return [f for f in g.files if f.verdict in wanted] or list(g.files)
+        """Which files of a group an action applies to: only the ones suggested for it. 'Review' files
+        need picking by hand (open the group), except the extra copies in the duplicates group."""
+        if action == "delete":
+            if g.key == "dupes":
+                return [f for f in g.files if f.duplicate_of]
+            return [f for f in g.files if f.verdict == kb.DELETE]
+        if action == "move":
+            return [f for f in g.files if f.verdict == kb.MOVE]
+        return list(g.files)
 
     def show_group(self, g: Group) -> None:
         chunks: list[tuple[str, str]] = [(g.title + "\n", "title"), (g.what + "\n", "")]
@@ -549,13 +584,16 @@ class App(tk.Tk):
                 chunks.append((f"{W.ICONS[v]}  {v}: {plural(n, 'file')}, {human_size(g.by_verdict[v])}\n", v))
         dels, moves = self._group_files(g, "delete"), self._group_files(g, "move")
         chunks.append(("What the buttons do\n", "h"))
-        if g.deletable:
-            chunks.append((f"Delete removes the {plural(len(dels), 'file')} marked Delete or Review "
-                           f"({human_size(sum(f.size for f in dels))}) and leaves the rest alone.\n", ""))
+        if dels:
+            what = "extra copies (the originals stay)" if g.key == "dupes" else "files marked Safe to delete"
+            chunks.append((f"Delete removes the {plural(len(dels), 'file')}: {what} "
+                           f"({human_size(sum(f.size for f in dels))}). Everything else stays.\n", ""))
         else:
-            chunks.append(("Nothing here is marked for deleting. Delete would remove the whole group, "
-                           "after a warning.\n", ""))
-        if g.movable:
+            chunks.append(("Nothing here is marked Safe to delete, so Delete does nothing for the whole group.\n", ""))
+        if g.review and g.key != "dupes":
+            chunks.append((f"{human_size(g.review)} is marked Review: open the group, check those files and "
+                           "select the ones you want to delete.\n", ""))
+        if moves:
             chunks.append((f"Move sends the {plural(len(moves), 'file')} marked Move "
                            f"({human_size(sum(f.size for f in moves))}) to your other drive.\n", ""))
         chunks.append(("Biggest files\n", "h"))
@@ -564,6 +602,8 @@ class App(tk.Tk):
         chunks.append(("\nOpen the group (click the arrow) to see every file and why.\n", "muted"))
         if g.deletable:
             badge = f"You can free {human_size(g.deletable)} here"
+        elif g.review:
+            badge = f"{human_size(g.review)} to check"
         elif g.movable:
             badge = f"You can move {human_size(g.movable)} to another drive"
         else:
@@ -777,14 +817,16 @@ class App(tk.Tk):
 
     def on_select(self) -> None:
         sel = self.selected_entries()
-        self._set_buttons(bool(sel))
-        if not sel:
+        group_chosen = self.tabs.select() == str(self.groups_tab) and any(
+            i in self.group_rows for i in self.gtree.selection())
+        self._set_buttons(bool(sel) or group_chosen)
+        if not sel and not group_chosen:
             return
         if self.tabs.select() == str(self.groups_tab):
             chosen = self.gtree.selection()
             if len(chosen) == 1 and chosen[0] in self.group_rows:
                 self.current = None
-                for b in (self.btn_ai, self.btn_open, self.btn_reveal):
+                for b in (self.btn_open, self.btn_reveal):
                     b.configure(state="disabled")
                 self.show_group(self.group_rows[chosen[0]])
                 return
@@ -913,12 +955,20 @@ class App(tk.Tk):
         return None
 
     def delete_selected(self) -> None:
-        self._delete(self.selected_entries("delete"))
+        entries = self.selected_entries("delete")
+        if not entries and self.tabs.select() == str(self.groups_tab) and self.gtree.selection():
+            messagebox.showinfo("File Sorter", "Nothing in this group is marked Safe to delete.\n\nOpen the group "
+                                               "(click the arrow), check the files and select the ones you want "
+                                               "to delete.")
+            return
+        self._delete(entries)
 
     def clean_up(self) -> None:
         """One click: delete everything marked 'Safe to delete'."""
         if self.result:
-            self._delete([f for f in self.result.files if f.verdict == kb.DELETE], cleanup=True)
+            # one click needs the strictest bar: no cloud-synced files (deleting them deletes them everywhere)
+            self._delete([f for f in self.result.files if f.verdict == kb.DELETE and not f.assessment.warnings],
+                         cleanup=True)
 
     def _summary(self, entries: list[FileEntry]) -> str:
         if len(entries) <= 8:
@@ -947,7 +997,8 @@ class App(tk.Tk):
         drives = {os.path.splitdrive(f.path)[0]: f.path for f in entries}  # one check per drive is enough
         if all(actions.recycle_bin_works_for(p) for p in drives.values()):
             intro = ("Clean up everything marked 'Safe to delete'? These are caches, temporary files, crash "
-                     "dumps and other leftovers.\n\n" if cleanup else "")
+                     "dumps, update leftovers and similar files programs recreate or never need again. "
+                     "Files in cloud-synced folders are left out.\n\n" if cleanup else "")
             if not messagebox.askyesno("Clean up" if cleanup else "Delete files",
                                        f"{intro}Send {plural(len(entries), 'file')} ({human_size(total)}) to the "
                                        f"Recycle Bin?\n\n{names}{warn}"):
@@ -962,16 +1013,22 @@ class App(tk.Tk):
                                        f"({why})\n\n{names}{warn}", icon="warning"):
                 return
             permanently = True
-        paths = [f.path for f in entries]
-        self._run_action("Deleting", lambda progress: actions.delete_files(paths, permanently, progress), "Deleted")
+        singles, folders = whole_folders([f.path for f in entries], self.result) if self.result else \
+            ([f.path for f in entries], {})
+        self._last_delete_permanent = permanently
+        self._run_action("Deleting", lambda progress: actions.delete_files(singles, permanently, progress, folders),
+                         "Deleted")
 
     def move_selected(self) -> None:
         entries = self._guard_system(self.selected_entries("move"), "move")
         if not entries or not self.result:
             return
-        dest = filedialog.askdirectory(title="Choose where to move the files (e.g. your other drive)")
+        dest = filedialog.askdirectory(title="Choose where to move the files (e.g. your other drive)",
+                                       initialdir=self.prefs.move_destination or None)
         if not dest:
             return
+        self.prefs.move_destination = dest
+        self.prefs.save()
         dest = os.path.abspath(dest)
         root = os.path.abspath(self.result.root)
         try:
@@ -1010,32 +1067,38 @@ class App(tk.Tk):
         for b in (self.btn_move, self.btn_delete, self.scan_btn, self.dupe_btn, self.cleanup_btn):
             b.configure(state="disabled")
         self._spin(True)
+        last = [0.0]
+        files = list(self.result.files) if self.result else []
 
         def progress(i: int, n: int, path: str) -> None:
-            self.events.put(("status", f"{doing} {i + 1:,} of {n:,}: {os.path.basename(path)}"))
+            if time.time() - last[0] > 0.1:  # a status per file would flood the window
+                last[0] = time.time()
+                self.events.put(("status", f"{doing} {i + 1:,} of {n:,}: {os.path.basename(path)}"))
 
         def run() -> None:
             try:
                 report = work(progress)
             except Exception as e:  # noqa: BLE001
                 report = actions.ActionReport(failed=[("", str(e))])
-            self.events.put(("action_done", report, verb))
+            done = {src for src, _ in report.done}
+            remaining = [f for f in files if f.path not in done]
+            gone = [f for f in files if f.path in done]
+            changed = regroup_duplicates(remaining)  # a copy whose original is gone is no longer a duplicate
+            self.events.put(("action_done", report, verb, remaining, gone, changed, build_groups(remaining)))
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _after_action(self, report: actions.ActionReport, verb: str) -> None:
+    def _after_action(self, report: actions.ActionReport, verb: str, remaining=None, gone=(), changed=(),
+                      groups=None) -> None:
         self.busy = False
         self._spin(False)
         self.scan_btn.configure(state="normal")
         self.dupe_btn.configure(state="normal")
-        done = {src for src, _ in report.done}
-        if self.result:
-            gone = [f for f in self.result.files if f.path in done]
-            self.result.files = [f for f in self.result.files if f.path not in done]
+        if self.result and remaining is not None:
+            self.result.files = remaining
             for f in gone:
                 index_shift(self.result, f, f.verdict, None)
-            # a copy whose original is gone is no longer a duplicate
-            for f, old in regroup_duplicates(self.result.files):
+            for f, old in changed:
                 index_shift(self.result, f, old, f.verdict)
             for f in gone:  # keep the "Biggest folders" numbers right
                 d = os.path.dirname(f.path)
@@ -1045,7 +1108,12 @@ class App(tk.Tk):
                     if os.path.dirname(d) == d:
                         break
                     d = os.path.dirname(d)
+            self.groups = groups if groups is not None else build_groups(remaining)
         self.status_var.set(f"{verb} {plural(len(report.done), 'file')} ({human_size(report.bytes)}).")
+        if verb == "Deleted" and report.bytes:
+            self.prefs.freed_bytes += report.bytes
+            self.prefs.save()
+            self._show_freed()
         if report.log_error:
             messagebox.showwarning("File Sorter", f"The files were moved, but the list of moved files couldn't "
                                                   f"be saved: {report.log_error}")
@@ -1058,11 +1126,200 @@ class App(tk.Tk):
         self._update_drives_label()
         self.refresh_all()
         self._write_details([(f"{verb} {plural(len(report.done), 'file')} ({human_size(report.bytes)}).\n", "title")])
+        if verb == "Deleted" and report.bytes and not getattr(self, "_last_delete_permanent", True):
+            self._offer_empty_recycle_bin()
+
+    def _offer_empty_recycle_bin(self) -> None:
+        """Files in the Recycle Bin still use space; offer to empty it so the space is really freed."""
+        info = actions.recycle_bin_size()
+        if not info or not info[0]:
+            return
+        size, items = info
+        if messagebox.askyesno("Empty the Recycle Bin?",
+                               f"The deleted files are in the Recycle Bin, which now holds {human_size(size)} "
+                               f"({items:,} items). That space only becomes free when the Recycle Bin is "
+                               "emptied.\n\nEmpty it now? (You won't be able to restore those files afterwards.)"):
+            if actions.empty_recycle_bin():
+                self.status_var.set(f"Emptied the Recycle Bin: {human_size(size)} freed.")
+                self._update_drives_label()
+
+    # ------------------------------------------------------------------ tools, menus, never touch
+    def _show_freed(self) -> None:
+        if self.prefs.freed_bytes:
+            self.freed_label.configure(text=f"Freed with File Sorter so far: {human_size(self.prefs.freed_bytes)}")
+
+    def _tools_menu(self, parent) -> tk.Menu:
+        menu = tk.Menu(parent, tearoff=False)
+        win = sys.platform == "win32"
+        state = "normal" if win else "disabled"
+        menu.add_command(label="Empty the Recycle Bin...", command=self.tool_empty_bin, state=state)
+        menu.add_command(label="Open Disk Cleanup (Windows update leftovers)",
+                         command=lambda: self._try(actions.open_disk_cleanup), state=state)
+        menu.add_command(label="Open Storage settings (Storage Sense)",
+                         command=lambda: self._try(actions.open_storage_settings), state=state)
+        menu.add_command(label="Turn off hibernation (frees hiberfil.sys)...", command=self.tool_hibernation,
+                         state=state)
+        menu.add_separator()
+        menu.add_command(label="Move files back from the other drive...", command=self.tool_move_back)
+        menu.add_command(label="Never-touch list...", command=self.tool_never_touch_list)
+        return menu
+
+    def _try(self, fn) -> None:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("File Sorter", f"That didn't work: {e}")
+
+    def tool_empty_bin(self) -> None:
+        info = actions.recycle_bin_size()
+        if info is not None and not info[1]:
+            messagebox.showinfo("File Sorter", "The Recycle Bin is already empty.")
+            return
+        size = f" ({human_size(info[0])}, {info[1]:,} items)" if info else ""
+        if messagebox.askyesno("Empty the Recycle Bin?", f"Permanently delete everything in the Recycle Bin{size}? "
+                                                         "You won't be able to restore it afterwards."):
+            if actions.empty_recycle_bin():
+                self.status_var.set("Emptied the Recycle Bin.")
+                self._update_drives_label()
+
+    def tool_hibernation(self) -> None:
+        if messagebox.askyesno("Turn off hibernation?",
+                               "Windows keeps a hidden file (hiberfil.sys) as big as a large part of your memory, "
+                               "used for hibernation and Fast Startup. Turning hibernation off deletes it.\n\n"
+                               "Your PC will start a little slower from a full shutdown, and 'Hibernate' disappears "
+                               "from the power menu. You can turn it back on with 'powercfg /hibernate on'.\n\n"
+                               "Windows will ask for administrator permission. Continue?"):
+            if not actions.turn_off_hibernation():
+                messagebox.showwarning("File Sorter", "Hibernation wasn't turned off (permission was refused?).")
+
+    def tool_move_back(self) -> None:
+        if self.busy:
+            return
+        log = filedialog.askopenfilename(title="Open the list of moved files (moved_by_file_sorter.csv)",
+                                         initialdir=self.prefs.move_destination or None,
+                                         filetypes=[("File Sorter move list", actions.LOG_NAME), ("CSV", "*.csv")])
+        if not log:
+            return
+        if not messagebox.askyesno("Move files back?", "Put every file in this list back where it was before it "
+                                                       "was moved? Files are copied back and checked first."):
+            return
+        self._run_action("Moving back", lambda progress: actions.move_back(log, progress), "Moved back")
+
+    def tool_never_touch_list(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("Never touch")
+        win.configure(background=W.SURFACE)
+        win.transient(self)
+        ttk.Label(win, text="File Sorter never suggests deleting or moving anything in these folders.",
+                  style="Card.TLabel", padding=(12, 10)).pack(anchor="w")
+        box = tk.Listbox(win, width=70, height=10, relief="flat", highlightthickness=1,
+                         highlightbackground=W.BORDER, font=self.f["base"])
+        box.pack(fill="both", expand=True, padx=12)
+        for p in self.prefs.never_touch:
+            box.insert("end", p)
+        row = ttk.Frame(win, style="Card.TFrame", padding=12)
+        row.pack(fill="x")
+
+        def add() -> None:
+            d = filedialog.askdirectory(parent=win, title="Folder to never touch")
+            if d:
+                self.never_touch(d, ask=False)
+                box.insert("end", os.path.abspath(d))
+
+        def remove() -> None:
+            for i in reversed(box.curselection()):
+                folder = box.get(i)
+                self.prefs.never_touch = [p for p in self.prefs.never_touch if p != folder]
+                box.delete(i)
+            self.prefs.save()
+            messagebox.showinfo("File Sorter", "Removed. Scan again to get suggestions for that folder.", parent=win)
+
+        ttk.Button(row, text="Add folder...", command=add).pack(side="left")
+        ttk.Button(row, text="Remove", command=remove).pack(side="left", padx=6)
+        ttk.Button(row, text="Close", command=win.destroy).pack(side="right")
+
+    def never_touch(self, folder: str, ask: bool = True) -> None:
+        folder = os.path.abspath(folder)
+        if ask and not messagebox.askyesno("Never touch this folder?",
+                                           f"Never suggest deleting or moving anything in:\n{folder}\n\n"
+                                           "You can undo this in Tools -> Never-touch list."):
+            return
+        if folder not in self.prefs.never_touch:
+            self.prefs.never_touch.append(folder)
+            self.prefs.save()
+        if self.result:
+            for f in self.result.files:
+                if f.verdict != kb.KEEP and is_inside(f.path, [folder]):
+                    index_shift(self.result, f, f.verdict, kb.KEEP)
+                    f.assessment.verdict, f.assessment.protected = kb.KEEP, True
+                    f.assessment.reason = "You told File Sorter to never touch this folder."
+            self.groups = build_groups(self.result.files)
+            self.refresh_all()
+
+    def _context_menu(self, event, tree: ttk.Treeview) -> None:
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in tree.selection():
+            tree.selection_set(iid)
+        entry = (self.rows.get(iid) if tree is self.tree else self.gfile_rows.get(iid) if tree is self.gtree
+                 else None)
+        if tree is self.ftree:
+            folder = self.folder_rows.get(iid)
+        elif entry:
+            folder = os.path.dirname(entry.path)
+        elif iid in self.group_rows and self.group_rows[iid].files:
+            try:
+                folder = os.path.commonpath([os.path.dirname(f.path) for f in self.group_rows[iid].files[:2000]])
+            except ValueError:  # files on different drives
+                folder = None
+        else:
+            folder = None
+        menu = tk.Menu(self, tearoff=False)
+        if entry:
+            menu.add_command(label="Open", command=self.open_selected)
+            menu.add_command(label="Show in folder", command=self.reveal_selected)
+            menu.add_separator()
+        menu.add_command(label="Delete...", command=self.delete_selected)
+        menu.add_command(label="Move to other drive...", command=self.move_selected)
+        if folder and self.result and len(folder) > len(self.result.map_root):
+            menu.add_separator()
+            short = folder if len(folder) < 60 else "..." + folder[-57:]
+            menu.add_command(label=f"Never touch {short}", command=lambda: self.never_touch(folder))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _tab_changed(self) -> None:
+        """A selection on another tab must never be what Delete/Move act on."""
+        current = self.tabs.select()
+        for tree, tab in ((self.tree, self.files_tab), (self.gtree, self.groups_tab)):
+            if str(tab) != current and tree.selection():
+                tree.selection_remove(tree.selection())
+        self.current = None
+        self._set_buttons(False)
+
+    def _clear_selection(self) -> None:
+        for tree in (self.tree, self.gtree, self.ftree):
+            if tree.selection():
+                tree.selection_remove(tree.selection())
+        self.current = None
+        self._set_buttons(False)
+
+    def _focus_search(self, search) -> None:
+        self.tabs.select(self.files_tab)
+        search.focus_set()
 
     # ------------------------------------------------------------------ AI
+    def _selected_group(self) -> Group | None:
+        if self.tabs.select() == str(self.groups_tab):
+            chosen = self.gtree.selection()
+            if len(chosen) == 1 and chosen[0] in self.group_rows:
+                return self.group_rows[chosen[0]]
+        return None
+
     def ask_ai(self) -> None:
         f = self.current
-        if not f:
+        g = None if f else self._selected_group()
+        if not f and not g:
             return
         ok, why = ai.is_available()
         if not ok:
@@ -1073,7 +1330,8 @@ class App(tk.Tk):
                 "This sends the file's name, folder path, size, dates and type to Claude "
                 "(Anthropic's AI). The file's contents are NOT sent.\n\nContinue?"):
             return
-        facts = self._facts_for_ai(f)
+        facts = self._facts_for_ai(f) if f else self._facts_for_group(g)
+        key = f.path if f else f"group:{g.key}"
         self.btn_ai.configure(state="disabled", text="Asking...")
 
         def work() -> None:
@@ -1081,7 +1339,7 @@ class App(tk.Tk):
                 answer = ai.ask_about_file(facts)
             except Exception as e:  # noqa: BLE001
                 answer = f"Something went wrong: {e}"
-            self.events.put(("ai", f.path, answer))
+            self.events.put(("ai", key, answer))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1094,9 +1352,20 @@ class App(tk.Tk):
             lines.append(f"\n[{head}]\n{body}")
         return "\n".join(lines)
 
+    def _facts_for_group(self, g: Group) -> str:
+        lines = [f"A group of {len(g.files):,} files ({human_size(g.size)}) that File Sorter calls: {g.title}",
+                 f"File Sorter's description: {g.what}", f"Operating system: {sys.platform}", "Totals:"]
+        lines += [f"  {v}: {human_size(b)}" for v, b in g.by_verdict.items() if b]
+        lines.append("Biggest files (path, size, File Sorter's suggestion):")
+        for f in sorted(g.files, key=lambda f: f.size, reverse=True)[:25]:
+            lines.append(f"  {f.path}  {human_size(f.size)}  {f.verdict}")
+        lines.append("Explain what this group of files is, which program uses it, and what is safe to delete.")
+        return "\n".join(lines)
+
     def _show_ai_answer(self, path: str, answer: str) -> None:
         self.btn_ai.configure(text="Ask Claude")
-        if self.current and self.current.path == path:
+        g = self._selected_group()
+        if (self.current and self.current.path == path) or (g and path == f"group:{g.key}"):
             self.btn_ai.configure(state="normal")
             self.details.configure(state="normal")
             self.details.insert("end", "\nClaude says\n", "h")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import functools
 import os
+import re
 import string
 import sys
 import time
@@ -27,6 +28,7 @@ class Settings:
     stale_days: int = 365         # files untouched this long ...
     stale_min_mb: int = 20        # ... and at least this big are suggested for moving
     old_log_days: int = 30        # logs older than this are safe to delete
+    never_touch: tuple[str, ...] = ()  # folders the user asked to leave alone
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,11 @@ def base_name(path: str) -> str:
     return path.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def _in_any(path: str, prefixes: tuple[str, ...]) -> bool:
+    d = normalized_dir(path)
+    return any(d.startswith(p[1:]) if p.startswith("^") else p in d for p in prefixes)
+
+
 def match_folders(path: str) -> list[FolderMatch]:
     return list(_match_dir(normalized_dir(path)))
 
@@ -102,16 +109,25 @@ GAME_ANCHORS = [(("steamapps", "common"), "Steam game"), (("epic games",), "Epic
                 (("gog games",), "GOG game"), (("xboxgames",), "Xbox game")]
 
 
+NOT_GAMES = {"launcher", "epic online services", "directxredist", "steamworks shared", "steam controller configs"}
+
+
 def owning_app(path: str) -> str | None:
     """Guess which program a file belongs to from its folder."""
-    parts = path.replace("\\", "/").split("/")
+    p = path.replace("\\", "/")
+    return _owning_app_dir(p.rsplit("/", 1)[0] if "/" in p else "")
+
+
+@functools.lru_cache(maxsize=65536)
+def _owning_app_dir(folder: str) -> str | None:
+    parts = folder.split("/") + ["x"]  # 'x' stands for the file itself
     low = [p.lower() for p in parts]
     for anchor, label in GAME_ANCHORS:  # games: name the game itself
         n = len(anchor)
         for i in range(len(low) - n - 1):
-            if tuple(low[i:i + n]) == anchor:
+            if tuple(low[i:i + n]) == anchor and low[i + n] not in NOT_GAMES:
                 return f"{label}: {parts[i + n]}"
-    d = normalized_dir(path)
+    d = normalized_dir(folder + "/x")
     for frag, app in kb.APP_PATHS:
         if frag in d:
             return app
@@ -257,7 +273,12 @@ GAME_LABELS = {"Steam game", "Epic Games game", "Xbox / Game Pass game", "GOG ga
 
 def hidden_app_folder(path: str) -> str | None:
     """Name of a hidden (dot) settings folder the file is inside, e.g. '.vscode'."""
-    for seg in normalized_dir(path).split("/"):
+    return _hidden_in(normalized_dir(path))
+
+
+@functools.lru_cache(maxsize=65536)
+def _hidden_in(d: str) -> str | None:
+    for seg in d.split("/"):
         if seg.startswith(".") and seg not in kb.HIDDEN_OK and seg not in (".", ".."):
             return seg
     return None
@@ -278,6 +299,7 @@ def assess(path: str, size: int, mtime: float, atime: float,
     in_downloads = any(m.label == "Downloads" for m in contexts)
     in_cloud = any(m.label in CLOUD_LABELS for m in matches)
     in_game = primary is not None and primary.label in GAME_LABELS
+    in_user_folder = bool(contexts) and not in_downloads  # Documents, Desktop, Pictures, Videos, Music
 
     last_used = max(mtime, atime)
     age_days = max(0.0, (now - last_used) / DAY)
@@ -302,9 +324,14 @@ def assess(path: str, size: int, mtime: float, atime: float,
         a.type_desc = what
         return done(verdict, why)
 
-    for pattern, what, verdict, why in kb.KNOWN_PATTERNS:
-        if fnmatch.fnmatchcase(name_l, pattern):
+    for pattern, what, verdict, why, max_size, where in kb.KNOWN_PATTERNS:
+        hit = re.fullmatch(pattern[3:], name_l) if pattern.startswith("re:") else fnmatch.fnmatchcase(name_l, pattern)
+        if (hit and (max_size is None or size <= max_size)
+                and (where is None or _in_any(path, where))):
             a.type_desc = what
+            # a name-only match in your own folders could be something you saved on purpose
+            if verdict == DELETE_ and max_size is None and where is None and in_user_folder:
+                return done(REVIEW_, f"{why} It's in one of your own folders, so check it first.")
             return done(verdict, why)
 
     if in_game:
@@ -315,8 +342,8 @@ def assess(path: str, size: int, mtime: float, atime: float,
         d = normalized_dir(path)
         generic = primary.fragment in kb.GENERIC_CACHE_FRAGMENTS and not any(m in d for m in kb.APP_DATA_MARKERS)
         in_trash = primary.label in ("Recycle Bin", "Trash")  # already deleted once by the user
-        # Windows' own folders (anchored rules) never hold personal files; a top-level Temp folder might
-        windows_owned = primary.fragment.startswith("^") and primary.fragment not in ("^/temp/", "^/tmp/", "^/var/tmp/")
+        # Windows' own folders never hold personal files (any other folder name can, on any drive)
+        windows_owned = primary.fragment.startswith(("^/windows/", "^/$", "^/programdata/"))
         if (kind in kb.PERSONAL_KINDS and not (in_trash or windows_owned)) or generic:
             return done(REVIEW_, f"It's in a folder called '{primary.label}', but this looks like a real file, "
                                  "not program-generated junk. Check before deleting.")
@@ -332,12 +359,18 @@ def assess(path: str, size: int, mtime: float, atime: float,
             return done(REVIEW_, "Unfinished download that changed in the last day; it may still be downloading.")
         return done(DELETE_, "A download that never finished. The file is incomplete and can't be used.")
 
+    if kind in ("temp", "dump", "cache") and in_user_folder:
+        return done(REVIEW_, "Looks like a leftover from a program, but it's in one of your own folders, so "
+                             "check it first.")
     if kind in ("temp", "dump", "cache"):
         return done(DELETE_, {"temp": "Temporary leftover from a program.",
                               "dump": "Crash dump; only useful for debugging an old crash.",
                               "cache": "Cache/build file that gets recreated automatically."}[kind])
 
     if kind == "log":
+        if mod_age_days > s.old_log_days and in_user_folder:
+            return done(REVIEW_, f"Old log file (not written to in {int(mod_age_days)} days). It's in one of your "
+                                 "own folders, so it could be something you saved on purpose (like chat logs).")
         if mod_age_days > s.old_log_days:
             return done(DELETE_, f"Log file not written to in {int(mod_age_days)} days. "
                                  "Logs are only needed for troubleshooting.")

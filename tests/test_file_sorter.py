@@ -467,17 +467,21 @@ def test_owning_app_names_games_and_apps():
 
 def test_product_key():
     from file_sorter.smart import product_key
-    assert product_key("vlc-3.0.20-win64.exe") == product_key("vlc-3.0.18-win64.exe") == "vlc"
+    assert product_key("vlc-3.0.20-win64.exe") == product_key("vlc-3.0.18-win64.exe") == "vlcwin64"
+    assert product_key("vlc-3.0.20-win64.exe", with_arch=False) == "vlc"
     assert product_key("ChromeSetup.exe") == "chrome"
-    assert product_key("7z2408-x64.exe") == "7z"
-    assert product_key("node-v20.11.0-x64.msi") == "node"
+    assert product_key("node-v20.11.0-x64.msi") != product_key("node-v20.11.0-x86.msi")  # x64 and x86 differ
+    # years and KB numbers name different products, not versions of one
+    assert product_key("TurboTax2022_Setup.exe") != product_key("TurboTax2023_Setup.exe")
+    assert product_key("windows10.0-kb5034441-x64.msu") != product_key("windows10.0-kb5034122-x64.msu")
+    assert product_key("Driver_Setup_1.2.exe") is None  # too generic to compare
 
 
 def test_smart_installers_and_leftovers(tree):
     from file_sorter.smart import Program, leftover_app_data, smart_installers
     dl = tree / "Downloads"
     for name, age in (("vlc-3.0.18-win64.exe", 50), ("vlc-3.0.20-win64.exe", 10), ("ChromeSetup.exe", 5),
-                      ("zoom_installer.exe", 5)):
+                      ("zoom_installer.exe", 5), ("TurboTax2022_Setup.exe", 400), ("TurboTax2023_Setup.exe", 30)):
         (dl / name).write_bytes(b"MZ" + b"\0" * 100)
         os.utime(dl / name, (NOW - age * 86400,) * 2)
     for app, age in (("Spotify", 300), ("OldGameLauncher", 300), ("StoreGame", 2)):
@@ -491,15 +495,25 @@ def test_smart_installers_and_leftovers(tree):
     smart_installers(res.files, installed)
     leftover_app_data(res.files, installed)
     by = {f.name: f for f in res.files}
-    assert by["vlc-3.0.18-win64.exe"].verdict == kb.DELETE and "newer" in by["vlc-3.0.18-win64.exe"].assessment.reason
-    assert by["vlc-3.0.20-win64.exe"].verdict == kb.DELETE and "already installed" in \
+    # guesses explain, but never make an installer "Safe to delete" (one-click Clean up must not take them)
+    assert by["vlc-3.0.18-win64.exe"].verdict == kb.REVIEW and "newer" in by["vlc-3.0.18-win64.exe"].assessment.reason
+    assert by["vlc-3.0.20-win64.exe"].verdict == kb.REVIEW and "already installed" in \
         by["vlc-3.0.20-win64.exe"].assessment.reason
-    assert by["ChromeSetup.exe"].verdict == kb.DELETE
-    assert by["zoom_installer.exe"].verdict == kb.REVIEW  # not installed: user may still need it
+    assert "already installed" in by["ChromeSetup.exe"].assessment.reason
+    assert not by["zoom_installer.exe"].assessment.reason.startswith("Installer for")
+    assert "Older installer" not in by["TurboTax2022_Setup.exe"].assessment.reason
     settings = [f for f in res.files if f.name == "settings.json"]
     verdicts = {os.path.basename(os.path.dirname(f.path)): f.verdict for f in settings}
     # StoreGame isn't registered as installed, but it's still being used: not a leftover
     assert verdicts == {"Spotify": kb.SYSTEM, "OldGameLauncher": kb.REVIEW, "StoreGame": kb.SYSTEM}
+    # a folder holding saves (or mail, wallets, password vaults...) is never called a leftover
+    saves = tree / "AppData" / "Roaming" / "OldRPG" / "saves"
+    saves.mkdir(parents=True)
+    (saves / "slot1.sav").write_bytes(b"x")
+    os.utime(saves / "slot1.sav", (NOW - 400 * 86400,) * 2)
+    res3 = scan(str(tree), Settings(), find_duplicates=False)
+    leftover_app_data(res3.files, installed)
+    assert next(f for f in res3.files if f.name == "slot1.sav").verdict == kb.SYSTEM
     # without a list of installed programs nothing is guessed
     res2 = scan(str(tree), Settings(), find_duplicates=False)
     assert leftover_app_data(res2.files, []) == 0
@@ -527,7 +541,7 @@ def test_groups(tree):
     assert sum(len(g.files) for g in groups.values()) == len(res.files)
     # groups that free the most space come first
     ordered = build_groups(res.files)
-    wins = [g.deletable + g.movable for g in ordered]
+    wins = [g.deletable + g.movable + g.review for g in ordered]
     assert wins == sorted(wins, reverse=True)
 
 
@@ -553,3 +567,114 @@ def test_batch_delete_reports_each_file(tree, monkeypatch):
     assert isinstance(calls[0], list) and len(calls[0]) == 3  # one call for the whole batch
     assert sorted(os.path.basename(p) for p, _ in report.done) == ["one.bin", "two.bin"]
     assert [os.path.basename(p) for p, _ in report.failed] == ["locked.bin"]
+
+
+# ------------------------------------------------------------- whole folders, undo, never touch
+
+def test_whole_folders_never_above_a_junk_folder(tree):
+    from file_sorter.scanner import whole_folders
+    local = tree / "AppData" / "Local"
+    data = local / "Google" / "Chrome" / "User Data" / "Default" / "Cache" / "Cache_Data"
+    data.mkdir(parents=True)
+    (data / "f1").write_bytes(b"x")
+    (data.parent / "index").write_bytes(b"x")
+    res = scan(str(tree), find_duplicates=False)
+    paths = [f.path for f in res.files if str(local) in f.path]  # every file under AppData\Local
+    singles, folders = whole_folders(paths, res)
+    assert list(folders) == [str(data)]  # only inside the Cache folder; never Cache, Chrome or AppData\Local
+
+
+def test_whole_folders_are_deleted_as_one(tree):
+    from file_sorter.scanner import whole_folders
+    proj = tree / "code" / "app" / "node_modules"
+    for pkg in ("react", "lodash"):
+        (proj / pkg / "lib").mkdir(parents=True)
+        (proj / pkg / "index.js").write_text("x")
+        (proj / pkg / "lib" / "a.js").write_text("x")
+    (proj / "react" / "link").symlink_to(tree / "notes.txt")  # a folder holding a link is never deleted whole
+    res = scan(str(tree), find_duplicates=False)
+    paths = [f.path for f in res.files if "node_modules" in f.path]
+    singles, folders = whole_folders(paths, res)
+    # node_modules is a 'Review' folder, not a 'Safe to delete' one: nothing is collapsed there
+    assert folders == {} and sorted(singles) == sorted(paths)
+    tmp = tree / "AppData" / "Local" / "Temp"
+    for d in ("ab12", "cd34"):
+        (tmp / d / "sub").mkdir(parents=True)
+        (tmp / d / "sub" / "x.tmp").write_text("x")
+    (tmp / "cd34" / "link").symlink_to(tree / "notes.txt")  # a folder holding a link is never deleted whole
+    res = scan(str(tree), find_duplicates=False)
+    paths = [f.path for f in res.files if os.sep + "Temp" + os.sep in f.path]
+    singles, folders = whole_folders(paths, res)
+    # Temp itself stays (programs expect it); cd34 holds a link so only its clean subfolder goes whole
+    assert sorted(folders) == [str(tmp / "ab12"), str(tmp / "cd34" / "sub")]
+    # a partly selected folder is not deleted whole
+    singles, folders = whole_folders([p for p in paths if "ab12" not in p], res)
+    assert str(tmp / "ab12") not in folders
+
+
+def test_delete_folder_units(tree, monkeypatch):
+    d = tree / "AppData" / "Local" / "SomeApp" / "Cache" / "sub"
+    d.mkdir(parents=True)
+    (d / "x.bin").write_bytes(b"12345")
+    (d / "y.bin").write_bytes(b"123")
+    calls = []
+
+    def fake_trash(p):
+        calls.append(p)
+        (shutil.rmtree if os.path.isdir(p) else os.remove)(p)
+
+    monkeypatch.setattr(actions, "_send2trash", fake_trash)
+    report = actions.delete_files([], folders={str(d): [str(d / "x.bin"), str(d / "y.bin")]})
+    assert calls == [str(d)] and not d.exists()
+    assert sorted(os.path.basename(p) for p, _ in report.done) == ["x.bin", "y.bin"] and report.bytes == 8
+
+
+def test_move_back(tree, tmp_path_factory):
+    dest = tmp_path_factory.mktemp("otherdrive")
+    src = tree / "Videos" / "a.mp4"
+    data = src.read_bytes()
+    actions.move_files([str(src)], str(tree), str(dest))
+    assert not src.exists()
+    report = actions.move_back(str(dest / actions.LOG_NAME))
+    assert report.done and src.read_bytes() == data
+    assert not (dest / actions.LOG_NAME).exists()  # everything is back: the log is gone
+
+
+def test_never_touch(tree):
+    res = scan(str(tree), Settings(never_touch=(str(tree / "AppData"),)), find_duplicates=False)
+    blob = next(f for f in res.files if f.name == "blob")
+    assert blob.verdict == kb.KEEP and "never touch" in blob.assessment.reason
+
+
+def test_prefs_roundtrip(tmp_path):
+    from file_sorter.prefs import Prefs, is_inside
+    p = Prefs(last_folder="C:\\Users\\me", never_touch=["D:\\Keep"], freed_bytes=123)
+    path = str(tmp_path / "s.json")
+    p.save(path)
+    assert Prefs.load(path) == p
+    assert Prefs.load(str(tmp_path / "missing.json")) == Prefs()
+    (tmp_path / "bad.json").write_text("{not json")
+    assert Prefs.load(str(tmp_path / "bad.json")) == Prefs()
+    assert is_inside("/a/b/c.txt", ["/a/b"]) and not is_inside("/a/bc/d.txt", ["/a/b"])
+
+
+
+@pytest.mark.parametrize("path,size,verdict", [
+    ("C:\\Users\\me\\Documents\\Thesis.~final.docx", 9000, kb.KEEP),
+    ("C:\\Users\\me\\Pictures\\photo.~1.jpg", 300000, kb.KEEP),
+    ("C:\\Users\\me\\Pictures\\~$wedding.jpg", 5 * MB, kb.KEEP),
+    ("C:\\Users\\me\\Documents\\~$budget.xlsx", 165, kb.DELETE),
+    ("C:\\Users\\me\\AppData\\Local\\Temp\\report.~tmp", 1000, kb.DELETE),
+    ("C:\\Users\\me\\Desktop\\cbs_notes.log", 1000, kb.REVIEW),  # old log in a user folder: check it
+    ("C:\\Windows\\Logs\\CBS\\CBS.log", 10 * MB, kb.DELETE),
+    ("D:\\AMD\\Shareholder letter.pdf", 100000, kb.REVIEW),
+    ("D:\\AMD\\Ryzen build photo.jpg", 3 * MB, kb.REVIEW),
+    ("C:\\AMD\\Chipset_Drivers\\Packages\\x.inf", 1000, kb.DELETE),
+    ("C:\\Users\\me\\OneDrive\\Logs\\config.json", 1000, kb.KEEP),
+    ("C:\\Users\\me\\AppData\\Local\\Microsoft\\OneDrive\\logs\\Business1\\x.odl", 1000, kb.DELETE),
+    ("C:\\Users\\me\\Documents\\oracle_export.dmp", 50 * MB, kb.REVIEW),
+    ("C:\\Users\\me\\Documents\\mIRC\\logs\\friends.log", 5000, kb.REVIEW),
+])
+def test_review_false_positives(path, size, verdict):
+    r = a(path, size=size, mtime=OLD)
+    assert r.verdict == verdict, r.reason

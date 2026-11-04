@@ -14,7 +14,8 @@ from typing import Callable
 
 from . import knowledge as kb
 from . import smart
-from .analysis import Assessment, Settings, assess, human_size
+from .prefs import is_inside
+from .analysis import Assessment, Settings, assess, human_size, normalized_dir
 
 SKIP_LINUX_ROOTS = {"/proc", "/sys", "/dev", "/run"}
 
@@ -57,6 +58,7 @@ class ScanResult:
     seconds: float = 0.0
     cancelled: bool = False
     duplicates_checked: bool = False
+    impure: set[str] = field(default_factory=set)  # folders holding links/unreadable items
     # space map index: folder -> verdict -> bytes (direct files / including subfolders), and subfolders
     map_root: str = ""
     by_dir: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -75,6 +77,39 @@ class ScanResult:
 ProgressFn = Callable[[int, int, str], None]  # (files seen, bytes seen, current folder)
 
 
+def _list_dir(folder: str):
+    """(subfolders, [(path, stat)], impure, errors). Impure: holds links or items we couldn't read,
+    so the folder must never be deleted as a whole."""
+    subdirs, files = [], []
+    impure, errors = False, 0
+    try:
+        it = os.scandir(folder)
+    except OSError:
+        return [], [], True, 1
+    with it:
+        for entry in it:
+            try:
+                if entry.is_symlink():
+                    impure = True
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    attrs = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+                    if attrs & REPARSE_POINT:  # junctions: never followed, never deleted through
+                        impure = True
+                    else:
+                        subdirs.append(entry.path)
+                    continue
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                impure, errors = True, errors + 1
+                continue
+            if stat.S_ISREG(st.st_mode):
+                files.append((entry.path, st))
+            else:
+                impure = True
+    return subdirs, files, impure, errors
+
+
 def scan(root: str, settings: Settings | None = None, find_duplicates: bool = True,
          cancel: threading.Event | None = None, progress: ProgressFn | None = None) -> ScanResult:
     settings = settings or Settings()
@@ -86,9 +121,10 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
     folder_sizes: dict[str, int] = defaultdict(int)
     folder_counts: dict[str, int] = defaultdict(int)
 
-    stack = [root]
+    never = list(settings.never_touch)
     seen_bytes = 0
     last_report = 0.0
+    stack = [root]
     while stack:
         if cancel.is_set():
             result.cancelled = True
@@ -96,49 +132,34 @@ def scan(root: str, settings: Settings | None = None, find_duplicates: bool = Tr
         folder = stack.pop()
         if folder in SKIP_LINUX_ROOTS:
             continue
-        try:
-            it = os.scandir(folder)
-        except OSError:
-            result.errors += 1
-            continue
+        subdirs, entries, impure, errors = _list_dir(folder)
+        stack.extend(subdirs)
+        result.errors += errors
+        if impure:
+            result.impure.add(folder)
+        untouchable = bool(never) and is_inside(folder, never)
         local_bytes = 0
-        local_count = 0
-        with it:
-            for entry in it:
-                try:
-                    if entry.is_symlink():
-                        continue
-                    if entry.is_dir(follow_symlinks=False):
-                        attrs = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
-                        if not attrs & REPARSE_POINT:
-                            stack.append(entry.path)
-                        continue
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
-                    st = entry.stat(follow_symlinks=False)
-                except OSError:
-                    result.errors += 1
-                    continue
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                size = st.st_size
-                a = assess(entry.path, size, st.st_mtime, st.st_atime, settings, now)
-                f = FileEntry(entry.path, size, st.st_mtime, st.st_atime, a)
-                if getattr(st, "st_file_attributes", 0) & ONLINE_ONLY:
-                    f.online_only = True
-                    a.verdict = kb.KEEP
-                    a.reason = ("Online-only cloud file: it's listed here but stored in the cloud, so it "
-                                "takes (almost) no space on this drive.")
-                result.files.append(f)
-                local_bytes += size
-                local_count += 1
+        for path, st in entries:
+            size = st.st_size
+            a = assess(path, size, st.st_mtime, st.st_atime, settings, now)
+            f = FileEntry(path, size, st.st_mtime, st.st_atime, a)
+            if getattr(st, "st_file_attributes", 0) & ONLINE_ONLY:
+                f.online_only = True
+                a.verdict = kb.KEEP
+                a.reason = ("Online-only cloud file: it's listed here but stored in the cloud, so it "
+                            "takes (almost) no space on this drive.")
+            if untouchable:
+                a.verdict, a.protected = kb.KEEP, True
+                a.reason = "You told File Sorter to never touch this folder."
+            result.files.append(f)
+            local_bytes += size
         seen_bytes += local_bytes
         # add this folder's direct files to it and every parent up to the root
-        if local_count:
+        if entries:
             d = folder
             while True:
                 folder_sizes[d] += local_bytes
-                folder_counts[d] += local_count
+                folder_counts[d] += len(entries)
                 if d == root or len(d) <= len(root):
                     break
                 parent = os.path.dirname(d)
@@ -453,3 +474,94 @@ def _drop_hard_links(group: list[FileEntry]) -> list[FileEntry]:
             seen.add(key)
             out.append(f)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Deleting whole folders at once
+# ---------------------------------------------------------------------------
+
+def _is_rule_folder(folder: str) -> bool:
+    """True for a folder a rule is about (Temp, Cache, node_modules, Downloads...): programs expect
+    those to exist, so only their contents are ever deleted, never the folder itself."""
+    d = normalized_dir(os.path.join(folder, "x"))
+    for frag, *_ in kb.FOLDER_RULES:
+        core = frag.lstrip("^")
+        if (d == core) if frag.startswith("^") else d.endswith(core):
+            return True
+    return False
+
+
+_DELETE_CORES = None
+
+
+def _inside_junk_folder(folder: str) -> bool:
+    """True only for folders strictly inside a folder a 'Safe to delete' rule is about (e.g. something
+    inside Temp or a Cache folder). Never the rule folder itself, never anything above it."""
+    global _DELETE_CORES
+    if _DELETE_CORES is None:
+        _DELETE_CORES = [(frag.startswith("^"), frag.lstrip("^")) for frag, _l, _w, verdict, _y in kb.FOLDER_RULES
+                         if verdict == kb.DELETE]
+    d = normalized_dir(os.path.join(folder, "x"))
+    for anchored, core in _DELETE_CORES:
+        if anchored:
+            if d.startswith(core) and d != core:
+                return True
+        else:
+            i = d.find(core)
+            if i >= 0 and i + len(core) < len(d):
+                return True
+    return False
+
+
+def whole_folders(paths: list[str], result: ScanResult) -> tuple[list[str], dict[str, list[str]]]:
+    """Split files to delete into (single files, {folder: its files}) where every file of a folder is
+    being deleted. Only folders inside junk folders (Temp, caches...) are ever deleted as a whole;
+    never ones holding links or unreadable items, the junk folders themselves, or anything above them."""
+    root = result.map_root or os.path.dirname(os.path.join(result.root, "x"))
+    under: dict[str, int] = defaultdict(int)
+    for p in paths:
+        d = os.path.dirname(p)
+        while len(d) > len(root):
+            under[d] += 1
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    tainted = set()  # folders that hold, somewhere inside, something we didn't see as a plain file
+    for folder in result.impure:
+        d = folder
+        while d not in tainted:
+            tainted.add(d)
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    whole = sorted((d for d, n in under.items()
+                    if n == result.folder_counts.get(d, -1) and d not in tainted and not _is_rule_folder(d)
+                    and _inside_junk_folder(d)),
+                   key=len)
+    chosen: set[str] = set()
+    for d in whole:  # shortest first, so a folder is skipped when one of its parents is already chosen
+        x, inside = os.path.dirname(d), False
+        while len(x) > len(root) and not inside:
+            inside = x in chosen
+            parent = os.path.dirname(x)
+            if parent == x:
+                break
+            x = parent
+        if not inside:
+            chosen.add(d)
+    folders: dict[str, list[str]] = {c: [] for c in sorted(chosen)}
+    singles = []
+    for p in paths:
+        d = os.path.dirname(p)
+        owner = None
+        while len(d) > len(root):
+            if d in folders:
+                owner = d
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        (folders[owner].append(p) if owner else singles.append(p))
+    return singles, folders

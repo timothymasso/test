@@ -47,7 +47,13 @@ class Group:
 
     @property
     def deletable(self) -> int:
-        return self.by_verdict.get(kb.DELETE, 0) + self.by_verdict.get(kb.REVIEW, 0)
+        """Bytes marked Safe to delete (what Delete on the group removes)."""
+        return self.by_verdict.get(kb.DELETE, 0)
+
+    @property
+    def review(self) -> int:
+        """Bytes marked Review: to check and pick by hand."""
+        return self.by_verdict.get(kb.REVIEW, 0)
 
     @property
     def movable(self) -> int:
@@ -62,6 +68,21 @@ class Group:
         return max(order, key=lambda v: (self.by_verdict.get(v, 0), -order.index(v)))
 
 
+SYNC_APPS = {"OneDrive", "Dropbox", "Google Drive", "iCloud"}
+PERSONAL_GROUP_KINDS = {"video", "image", "raw_photo"} | set(PERSONAL)
+
+
+def _personal(f) -> tuple[str, str, str]:
+    a = f.assessment
+    if a.kind in ("video", "image", "raw_photo"):
+        year = time.localtime(f.mtime).tm_year
+        noun = "Videos" if a.kind == "video" else "Photos and pictures"
+        return f"media:{a.kind == 'video'}:{year}", f"{noun} from {year}", \
+            f"{noun} last changed in {year}. Older ones are good candidates for your other drive."
+    title, what = PERSONAL[a.kind]
+    return f"kind:{title}", title, what
+
+
 def group_of(f) -> tuple[str, str, str]:
     """(key, title, what it is) for one file."""
     a = f.assessment
@@ -69,6 +90,11 @@ def group_of(f) -> tuple[str, str, str]:
         return "dupes", "Duplicate copies", "Extra copies of files you already have elsewhere. The original is kept."
     app = owning_app(f.path)
     loc = a.location
+    # your own photos, videos and documents group by what they are, even inside OneDrive, Documents\Zoom
+    # or Pictures\Steam (screenshots)
+    if a.kind in PERSONAL_GROUP_KINDS and a.verdict not in (kb.DELETE, kb.SYSTEM) and \
+            (a.contexts or app in SYNC_APPS) and not a.protected:
+        return _personal(f)
     if loc and loc.verdict in (kb.DELETE, kb.REVIEW) and loc.label not in kb.CONTEXT_ONLY_LABELS:
         # generic folder names ("Cache folder") get the app's name in front; specific ones stand alone
         title = f"{app}: {loc.label}" if app and loc.fragment in PREFIX_WITH_APP else loc.label
@@ -78,6 +104,8 @@ def group_of(f) -> tuple[str, str, str]:
         if app:
             return f"junk:{app}:{a.kind}", f"{app}: {title.lower()}", what
         return f"junk:{a.kind}", title, what
+    if a.verdict == kb.SYSTEM and a.kind == "installer" and loc:  # Windows' installer caches: not yours
+        return f"loc:{loc.label}", loc.label, loc.what
     if a.kind == "installer" or (a.kind == "executable" and a.verdict in (kb.DELETE, kb.REVIEW)
                                  and looks_like_installer(base_name(f.path))):
         return "installers", "Installers", "Setup programs you downloaded. Once a program is installed, " \
@@ -98,14 +126,8 @@ def group_of(f) -> tuple[str, str, str]:
                                                                    "settings and data."
     if loc and loc.label not in kb.CONTEXT_ONLY_LABELS:
         return f"loc:{loc.label}", loc.label, loc.what
-    if a.kind in ("video", "image", "raw_photo"):
-        year = time.localtime(f.mtime).tm_year
-        noun = "Videos" if a.kind == "video" else "Photos and pictures"
-        return f"media:{a.kind == 'video'}:{year}", f"{noun} from {year}", \
-            f"{noun} last changed in {year}. Older ones are good candidates for your other drive."
-    if a.kind in PERSONAL:
-        title, what = PERSONAL[a.kind]
-        return f"kind:{title}", title, what
+    if a.kind in PERSONAL_GROUP_KINDS:
+        return _personal(f)
     if a.kind in ("executable", "library", "driver", "script"):
         return "programs", "Programs and tools", "Program files outside the usual install folders (portable apps, " \
                                                  "tools, scripts)."
@@ -122,4 +144,4 @@ def build_groups(files) -> list[Group]:
         g.files.append(f)
         g.by_verdict[f.verdict] = g.by_verdict.get(f.verdict, 0) + f.size
     # most space you can win back first, then biggest
-    return sorted(groups.values(), key=lambda g: (g.deletable + g.movable, g.size), reverse=True)
+    return sorted(groups.values(), key=lambda g: (g.deletable + g.movable + g.review, g.size), reverse=True)
