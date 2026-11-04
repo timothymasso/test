@@ -10,27 +10,20 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from collections import defaultdict
+
 from . import actions, ai
 from . import knowledge as kb
+from . import widgets as W
 from .analysis import Settings, explain, human_size, match_folders, owning_app
 from .scanner import FileEntry, ScanResult, scan
 
 MAX_ROWS = 3000
 
-VERDICT_COLORS = {
-    kb.DELETE: "#1e8e3e",
-    kb.REVIEW: "#b26a00",
-    kb.MOVE: "#1a73e8",
-    kb.KEEP: "#5f6368",
-    kb.SYSTEM: "#c5221f",
-}
-VERDICT_BG = {
-    kb.DELETE: "#e6f4ea",
-    kb.REVIEW: "#fef7e0",
-    kb.MOVE: "#e8f0fe",
-    kb.KEEP: "#ffffff",
-    kb.SYSTEM: "#fce8e6",
-}
+VERDICT_COLORS = {v: c[0] for v, c in W.COLORS.items()}
+VERDICT_COLORS[kb.KEEP] = "#4b5563"  # darker grey so Keep rows stay readable
+VERDICT_BG = {v: c[1] for v, c in W.COLORS.items()}
+VERDICT_BG[kb.KEEP] = W.SURFACE
 ALL = "Everything"
 DUPES = "Duplicates (copies and originals)"
 RUNNABLE_KINDS = {"executable", "library", "driver", "script", "installer"}
@@ -50,8 +43,11 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("File Sorter - what can I delete or move?")
-        self.geometry("1280x800")
-        self.minsize(900, 560)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{min(1400, sw - 40)}x{min(900, sh - 80)}+10+10")
+        self.minsize(1000, 640)
+        if sys.platform == "win32":
+            self.state("zoomed")  # start maximised: there's a lot to show
 
         self.result: ScanResult | None = None
         self.rows: dict[str, FileEntry] = {}
@@ -66,7 +62,11 @@ class App(tk.Tk):
         self.busy = False  # a move/delete is running
 
         self.path_var = tk.StringVar(value=default_scan_path())
-        self.dupes_var = tk.BooleanVar(value=True)
+        self.map_folder: str | None = None      # folder shown in the space map
+        self.folder_direct = False              # folder filter: only files directly in it
+        self.by_dir: dict[str, dict[str, int]] = {}
+        self.breakdown: dict[str, dict[str, int]] = {}
+        self.subfolders: dict[str, set[str]] = {}
         self.media_mb_var = tk.IntVar(value=50)
         self.stale_days_var = tk.IntVar(value=365)
         self.search_var = tk.StringVar()
@@ -80,92 +80,148 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ UI
     def _style(self) -> None:
-        style = ttk.Style(self)
-        if "clam" in style.theme_names() and sys.platform.startswith("linux"):
-            style.theme_use("clam")
-        style.configure("Treeview", rowheight=24)
-        style.configure("Heading.TLabel", font=("TkDefaultFont", 11, "bold"))
-        style.configure("Accent.TButton", font=("TkDefaultFont", 10, "bold"))
+        self.f = W.apply_theme(self)
+
+    def _card(self, parent, **pack) -> ttk.Frame:
+        """A white panel with a thin border."""
+        outer = tk.Frame(parent, background=W.BORDER, padx=1, pady=1)
+        outer.pack(**pack)
+        inner = ttk.Frame(outer, style="Card.TFrame", padding=(14, 10))
+        inner.pack(fill="both", expand=True)
+        return inner
 
     def _build(self) -> None:
-        # --- top bar
-        top = ttk.Frame(self, padding=(10, 8))
-        top.pack(fill="x")
-        ttk.Label(top, text="Scan:").pack(side="left")
-        entry = ttk.Entry(top, textvariable=self.path_var, width=60)
-        entry.pack(side="left", padx=4, fill="x", expand=True)
-        entry.bind("<Return>", lambda e: self.start_scan())
-        ttk.Button(top, text="Browse...", command=self.browse).pack(side="left", padx=2)
-        self.drive_menu = ttk.Menubutton(top, text="Drives")
-        self.drive_menu.pack(side="left", padx=2)
-        self._fill_drive_menu()
-        self.scan_btn = ttk.Button(top, text="Scan", style="Accent.TButton", command=self.start_scan)
-        self.scan_btn.pack(side="left", padx=(8, 2))
-        self.stop_btn = ttk.Button(top, text="Stop", command=self.stop_scan, state="disabled")
-        self.stop_btn.pack(side="left", padx=2)
-
-        opts = ttk.Frame(self, padding=(10, 0, 10, 6))
-        opts.pack(fill="x")
-        ttk.Checkbutton(opts, text="Find duplicate files", variable=self.dupes_var).pack(side="left")
-        ttk.Label(opts, text="   Suggest moving photos/videos/archives bigger than").pack(side="left")
-        ttk.Spinbox(opts, from_=1, to=100000, width=6, textvariable=self.media_mb_var).pack(side="left", padx=2)
-        ttk.Label(opts, text="MB,  and files unused for").pack(side="left")
-        ttk.Spinbox(opts, from_=30, to=10000, width=6, textvariable=self.stale_days_var).pack(side="left", padx=2)
-        ttk.Label(opts, text="days").pack(side="left")
-        self.drives_label = ttk.Label(opts, text="", foreground="#5f6368")
-        self.drives_label.pack(side="right")
+        f = self.f
+        # --- header
+        header = tk.Frame(self, background=W.HEADER, padx=18, pady=12)
+        header.pack(fill="x")
+        tk.Label(header, text="File Sorter", bg=W.HEADER, fg="white", font=f["title"]).pack(side="left")
+        tk.Label(header, text="   See what you can delete, and what to move to another drive",
+                 bg=W.HEADER, fg="#9ca3af", font=f["base"]).pack(side="left", pady=(5, 0))
+        self.drive_box = tk.Frame(header, background=W.HEADER)
+        self.drive_box.pack(side="right")
         self._update_drives_label()
 
-        # --- summary cards
-        self.cards = ttk.Frame(self, padding=(10, 0, 10, 6))
-        self.cards.pack(fill="x")
-        self.card_labels: dict[str, tk.Label] = {}
+        # --- scan bar
+        bar = self._card(self, fill="x", padx=14, pady=(14, 0))
+        row = ttk.Frame(bar, style="Card.TFrame")
+        row.pack(fill="x")
+        ttk.Label(row, text="Folder or drive", style="CardMuted.TLabel").pack(side="left", padx=(0, 8))
+        entry = ttk.Entry(row, textvariable=self.path_var, width=50)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda e: self.start_scan())
+        ttk.Button(row, text="Browse...", command=self.browse).pack(side="left", padx=(6, 0))
+        self.drive_menu = ttk.Menubutton(row, text="Drives")
+        self.drive_menu.pack(side="left", padx=(6, 0))
+        self._fill_drive_menu()
+        self.scan_btn = ttk.Button(row, text="Scan", style="Primary.TButton", command=self.start_scan)
+        self.scan_btn.pack(side="left", padx=(14, 0))
+        self.dupe_btn = ttk.Button(row, text="Scan + find duplicates",
+                                   command=lambda: self.start_scan(find_dupes=True))
+        self.dupe_btn.pack(side="left", padx=(6, 0))
+        self.stop_btn = ttk.Button(row, text="Stop", command=self.stop_scan, state="disabled")
+        self.stop_btn.pack(side="left", padx=(6, 0))
+        opts = ttk.Frame(bar, style="Card.TFrame")
+        opts.pack(fill="x", pady=(8, 0))
+        ttk.Label(opts, text="Suggest moving photos, videos and archives bigger than",
+                  style="CardMuted.TLabel").pack(side="left")
+        ttk.Spinbox(opts, from_=1, to=100000, width=6, textvariable=self.media_mb_var).pack(side="left", padx=4)
+        ttk.Label(opts, text="MB, and files not used for", style="CardMuted.TLabel").pack(side="left")
+        ttk.Spinbox(opts, from_=30, to=10000, width=6, textvariable=self.stale_days_var).pack(side="left", padx=4)
+        ttk.Label(opts, text="days.   'Scan' skips duplicates so it's fast; "
+                             "'Scan + find duplicates' also compares files.",
+                  style="CardMuted.TLabel").pack(side="left")
+
+        # --- summary: headline, cards, storage bar
+        summary = self._card(self, fill="x", padx=14, pady=(10, 0))
+        self.headline = ttk.Label(summary, text="Scan a folder to see where your space goes.", style="H2.TLabel")
+        self.headline.pack(anchor="w")
+        cards = ttk.Frame(summary, style="Card.TFrame")
+        cards.pack(fill="x", pady=(8, 6))
+        self.card_widgets: dict[str, tuple] = {}
         for v in [ALL] + kb.VERDICTS:
-            fg = VERDICT_COLORS.get(v, "#202124")
-            bg = VERDICT_BG.get(v, "#f1f3f4")
-            lbl = tk.Label(self.cards, text=v, justify="left", anchor="w", bg=bg, fg=fg,
-                           font=("TkDefaultFont", 10, "bold"), padx=10, pady=6, cursor="hand2",
-                           relief="groove", bd=1)
-            lbl.pack(side="left", fill="x", expand=True, padx=2)
-            lbl.bind("<Button-1>", lambda e, v=v: self.set_filter(v))
-            self.card_labels[v] = lbl
+            color = W.COLORS.get(v, (W.TEXT, W.BG))[0]
+            box = tk.Frame(cards, background=W.SURFACE, highlightthickness=1, highlightbackground=W.BORDER,
+                           cursor="hand2")
+            box.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            stripe = tk.Frame(box, background=color, height=4)
+            stripe.pack(fill="x")
+            name = tk.Label(box, text=f"{W.ICONS.get(v, '')}  {kb.SHORT.get(v, 'Everything')}".strip(),
+                            bg=W.SURFACE, fg=W.MUTED, font=f["bold"], anchor="w")
+            size = tk.Label(box, text="-", bg=W.SURFACE, fg=color if v != kb.KEEP else W.TEXT,
+                            font=f["big"], anchor="w")
+            count = tk.Label(box, text=" ", bg=W.SURFACE, fg=W.MUTED, font=f["small"], anchor="w")
+            for w in (name, size, count):
+                w.pack(fill="x", padx=10)
+            count.pack_configure(pady=(0, 6))
+            name.pack_configure(pady=(6, 0))
+            for w in (box, stripe, name, size, count):
+                w.bind("<Button-1>", lambda e, v=v: self.set_filter(v))
+            self.card_widgets[v] = (box, size, count)
+        self.storage_bar = W.StorageBar(summary, on_click=self.set_filter)
+        self.storage_bar.pack(fill="x")
 
         # --- main split
         paned = ttk.PanedWindow(self, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=10, pady=(0, 4))
-
+        paned.pack(fill="both", expand=True, padx=14, pady=10)
         left = ttk.Frame(paned)
-        right = ttk.Frame(paned)
+        right_outer = tk.Frame(paned, background=W.BORDER, padx=1, pady=1)
         paned.add(left, weight=3)
-        paned.add(right, weight=2)
+        paned.add(right_outer, weight=2)
+        right = ttk.Frame(right_outer, style="Card.TFrame")
+        right.pack(fill="both", expand=True)
 
         self.tabs = ttk.Notebook(left)
         self.tabs.pack(fill="both", expand=True)
 
+        # space map tab
+        map_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=10)
+        self.map_tab = map_tab
+        self.tabs.add(map_tab, text="  Space map  ")
+        mbar = ttk.Frame(map_tab, style="Card.TFrame")
+        mbar.pack(fill="x", pady=(0, 8))
+        self.up_btn = ttk.Button(mbar, text="\u2191 Up", command=self.map_up, state="disabled")
+        self.up_btn.pack(side="left")
+        self.map_path = ttk.Label(mbar, text="", style="H2.TLabel")
+        self.map_path.pack(side="left", padx=10)
+        legend = ttk.Frame(mbar, style="Card.TFrame")
+        legend.pack(side="right")
+        for v in kb.VERDICTS:
+            tk.Label(legend, text="\u25a0", fg=W.MAP_FILL[v], bg=W.SURFACE, font=f["h2"]).pack(side="left")
+            tk.Label(legend, text=kb.SHORT[v] + "  ", fg=W.MUTED, bg=W.SURFACE, font=f["small"]).pack(side="left")
+        self.space_map = W.SpaceMap(map_tab, on_open=self.map_open, on_hover=self._map_hover)
+        self.space_map.pack(fill="both", expand=True)
+        self.map_hint = ttk.Label(map_tab, text="Each box is a folder, sized by how much space it uses. "
+                                                "Colours show what's inside. Click a box to look inside it.",
+                                  style="CardMuted.TLabel")
+        self.map_hint.pack(fill="x", pady=(8, 0))
+
         # files tab
-        files_tab = ttk.Frame(self.tabs, padding=4)
-        self.tabs.add(files_tab, text="Files")
-        bar = ttk.Frame(files_tab)
-        bar.pack(fill="x", pady=(0, 4))
-        ttk.Label(bar, text="Show:").pack(side="left")
-        show = ttk.Combobox(bar, textvariable=self.show_var, values=[ALL] + kb.VERDICTS + [DUPES],
-                            state="readonly", width=26)
-        show.pack(side="left", padx=4)
+        files_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=10)
+        self.files_tab = files_tab
+        self.tabs.add(files_tab, text="  Files  ")
+        fbar = ttk.Frame(files_tab, style="Card.TFrame")
+        fbar.pack(fill="x", pady=(0, 8))
+        ttk.Label(fbar, text="Show", style="CardMuted.TLabel").pack(side="left")
+        show = ttk.Combobox(fbar, textvariable=self.show_var, values=[ALL] + kb.VERDICTS + [DUPES],
+                            state="readonly", width=30)
+        show.pack(side="left", padx=6)
         show.bind("<<ComboboxSelected>>", lambda e: self.refresh_files())
-        ttk.Label(bar, text="  Search:").pack(side="left")
-        search = ttk.Entry(bar, textvariable=self.search_var, width=24)
-        search.pack(side="left", padx=4)
+        ttk.Label(fbar, text="   Search", style="CardMuted.TLabel").pack(side="left")
+        search = ttk.Entry(fbar, textvariable=self.search_var, width=24)
+        search.pack(side="left", padx=6)
         self.search_var.trace_add("write", lambda *a: self._debounced_refresh())
-        self.folder_chip = ttk.Button(bar, text="", command=self.clear_folder_filter)
-        ttk.Button(bar, text="Select all shown", command=self.select_all).pack(side="right")
+        self.folder_chip = ttk.Button(fbar, text="", command=self.clear_folder_filter)
+        ttk.Button(fbar, text="Select all shown", command=self.select_all).pack(side="right")
 
         cols = ("name", "size", "verdict", "type", "used", "folder")
         self.tree = ttk.Treeview(files_tab, columns=cols, show="headings", selectmode="extended")
         heads = {"name": "Name", "size": "Size", "verdict": "Suggestion", "type": "Type",
                  "used": "Last used", "folder": "Folder"}
-        widths = {"name": 260, "size": 80, "verdict": 150, "type": 120, "used": 90, "folder": 300}
+        widths = {"name": 270, "size": 85, "verdict": 165, "type": 130, "used": 90, "folder": 300}
         for c in cols:
-            self.tree.heading(c, text=heads[c], command=lambda c=c: self.sort_by(c))
+            self.tree.heading(c, text=heads[c], anchor="e" if c == "size" else "w",
+                              command=lambda c=c: self.sort_by(c))
             self.tree.column(c, width=widths[c], anchor="e" if c == "size" else "w",
                              stretch=c in ("name", "folder"))
         for v in kb.VERDICTS:
@@ -179,15 +235,15 @@ class App(tk.Tk):
         self.tree.bind("<Delete>", lambda e: self.delete_selected())
 
         # folders tab
-        folders_tab = ttk.Frame(self.tabs, padding=4)
-        self.tabs.add(folders_tab, text="Biggest folders")
+        folders_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=10)
+        self.tabs.add(folders_tab, text="  Biggest folders  ")
         ttk.Label(folders_tab, text="Double-click a folder to list its files.",
-                  foreground="#5f6368").pack(anchor="w", pady=(0, 4))
+                  style="CardMuted.TLabel").pack(anchor="w", pady=(0, 8))
         fcols = ("folder", "size", "files", "what")
         self.ftree = ttk.Treeview(folders_tab, columns=fcols, show="headings", selectmode="browse")
         for c, t, w in (("folder", "Folder", 380), ("size", "Size", 90), ("files", "Files", 70),
                         ("what", "What it is", 260)):
-            self.ftree.heading(c, text=t)
+            self.ftree.heading(c, text=t, anchor="e" if c in ("size", "files") else "w")
             self.ftree.column(c, width=w, anchor="e" if c in ("size", "files") else "w",
                               stretch=c in ("folder", "what"))
         for v in kb.VERDICTS:
@@ -199,43 +255,55 @@ class App(tk.Tk):
         self.ftree.bind("<<TreeviewSelect>>", lambda e: self.on_folder_select())
         self.ftree.bind("<Double-1>", lambda e: self.drill_into_folder())
 
-        # details panel
-        ttk.Label(right, text="What is this file?", style="Heading.TLabel").pack(anchor="w", padx=6, pady=(4, 2))
-        txt_frame = ttk.Frame(right)
-        txt_frame.pack(fill="both", expand=True, padx=6)
-        self.details = tk.Text(txt_frame, wrap="word", relief="flat", padx=10, pady=8,
-                               font=("TkDefaultFont", 10), background="#fbfbfb")
-        dsb = ttk.Scrollbar(txt_frame, orient="vertical", command=self.details.yview)
+        # details panel: verdict banner, text, actions
+        self.badge = tk.Frame(right, background=W.BG, padx=14, pady=8)
+        self.badge_icon = tk.Label(self.badge, text="", bg=W.BG, fg="white", font=f["big"], width=2)
+        self.badge_icon.pack(side="left")
+        self.badge_text = tk.Label(self.badge, text="", bg=W.BG, fg="white", font=f["h2"], anchor="w",
+                                   justify="left")
+        self.badge_text.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.badge.bind("<Configure>", lambda e: self.badge_text.configure(wraplength=max(100, e.width - 80)))
+        self.details_frame = ttk.Frame(right, style="Card.TFrame")
+        self.details_frame.pack(fill="both", expand=True, padx=4, pady=4)
+        self.details = tk.Text(self.details_frame, wrap="word", relief="flat", padx=12, pady=10,
+                               font=f["base"], background=W.SURFACE, foreground=W.TEXT, borderwidth=0,
+                               highlightthickness=0, spacing1=1, spacing3=1)
+        dsb = ttk.Scrollbar(self.details_frame, orient="vertical", command=self.details.yview)
         self.details.configure(yscrollcommand=dsb.set, state="disabled")
         self.details.pack(side="left", fill="both", expand=True)
         dsb.pack(side="right", fill="y")
-        self.details.tag_configure("title", font=("TkDefaultFont", 13, "bold"), spacing3=6)
-        self.details.tag_configure("h", font=("TkDefaultFont", 10, "bold"), spacing1=10, spacing3=2)
-        self.details.tag_configure("mono", font=("TkFixedFont", 9), background="#f1f3f4")
-        self.details.tag_configure("muted", foreground="#5f6368")
+        self.details.tag_configure("title", font=f["title"], spacing3=8)
+        self.details.tag_configure("h", font=f["bold"], foreground=W.MUTED, spacing1=12, spacing3=3)
+        self.details.tag_configure("mono", font=("TkFixedFont", 9), background=W.BG, lmargin1=6, lmargin2=6)
+        self.details.tag_configure("muted", foreground=W.MUTED)
         for v in kb.VERDICTS:
-            self.details.tag_configure(v, foreground=VERDICT_COLORS[v], font=("TkDefaultFont", 11, "bold"))
+            self.details.tag_configure(v, foreground=VERDICT_COLORS[v], font=f["h2"])
 
-        btns = ttk.Frame(right, padding=(6, 6, 6, 0))
-        btns.pack(fill="x")
-        btns2 = ttk.Frame(right, padding=(6, 4, 6, 6))
-        btns2.pack(fill="x")
-        self.btn_open = ttk.Button(btns, text="Open", command=self.open_selected)
-        self.btn_reveal = ttk.Button(btns, text="Show in folder", command=self.reveal_selected)
-        self.btn_move = ttk.Button(btns, text="Move to other drive...", command=self.move_selected)
-        self.btn_delete = ttk.Button(btns, text="Delete...", command=self.delete_selected)
-        self.btn_ai = ttk.Button(btns2, text="Ask Claude about this file", command=self.ask_ai)
-        for b in (self.btn_open, self.btn_reveal, self.btn_move, self.btn_delete):
-            b.pack(side="left", padx=2, expand=True, fill="x")
-        self.btn_ai.pack(side="left", padx=2, expand=True, fill="x")
+        # two rows, pinned to the bottom so they never scroll away: actions, then helpers
+        helpers = ttk.Frame(right, style="Card.TFrame", padding=(10, 4, 10, 10))
+        helpers.pack(fill="x", side="bottom", before=self.details_frame)
+        acts = ttk.Frame(right, style="Card.TFrame", padding=(10, 6, 10, 0))
+        acts.pack(fill="x", side="bottom", before=helpers)
+        self.btn_move = ttk.Button(acts, text="\u2192  Move to other drive", style="Move.TButton",
+                                   command=self.move_selected)
+        self.btn_delete = ttk.Button(acts, text="\u2715  Delete", style="Danger.TButton",
+                                     command=self.delete_selected)
+        self.btn_open = ttk.Button(helpers, text="Open", command=self.open_selected)
+        self.btn_reveal = ttk.Button(helpers, text="Show in folder", command=self.reveal_selected)
+        self.btn_ai = ttk.Button(helpers, text="Ask Claude", command=self.ask_ai)
+        for b in (self.btn_move, self.btn_delete, self.btn_open, self.btn_reveal, self.btn_ai):
+            b.pack(side="left", padx=3, expand=True, fill="x")
         self._set_buttons(False)
 
         # status bar
-        status = ttk.Frame(self, padding=(10, 2, 10, 6))
-        status.pack(fill="x")
-        self.progress = ttk.Progressbar(status, mode="indeterminate", length=160)
-        self.progress.pack(side="right")
-        ttk.Label(status, textvariable=self.status_var).pack(side="left")
+        status = tk.Frame(self, background=W.SURFACE, padx=14, pady=6, highlightthickness=1,
+                          highlightbackground=W.BORDER)
+        status.pack(fill="x", side="bottom")
+        self.progress = ttk.Progressbar(status, mode="indeterminate", length=180)
+        tk.Label(status, textvariable=self.status_var, bg=W.SURFACE, fg=W.MUTED, font=f["small"],
+                 anchor="w").pack(side="left", fill="x", expand=True)
+        status.pack_forget()
+        status.pack(fill="x", before=paned, side="bottom")
 
     def _fill_drive_menu(self) -> None:
         menu = tk.Menu(self.drive_menu, tearoff=False)
@@ -247,16 +315,37 @@ class App(tk.Tk):
         self.drive_menu["menu"] = menu
 
     def _update_drives_label(self) -> None:
-        drives = actions.list_drives()
-        parts = [f"{r.rstrip(os.sep) or r} {human_size(f)} free" for r, f, t in drives[:4]]
-        self.drives_label.configure(text="   ".join(parts))
+        for w in self.drive_box.winfo_children():
+            w.destroy()
+        for root, free, total in actions.list_drives()[:4]:
+            W.DriveMeter(self.drive_box, root, free, total).pack(side="left", padx=(16, 0))
+
+    def _spin(self, on: bool) -> None:
+        if on:
+            self.progress.pack(side="right")
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            self.progress.pack_forget()
 
     def _set_buttons(self, on: bool) -> None:
         for b in (self.btn_open, self.btn_reveal, self.btn_move, self.btn_delete, self.btn_ai):
             b.configure(state="normal" if on else "disabled")
 
     # ------------------------------------------------------------ details text
-    def _write_details(self, chunks: list[tuple[str, str]]) -> None:
+    def _set_badge(self, verdict: str | None, text: str = "") -> None:
+        if not verdict:
+            self.badge.pack_forget()
+            return
+        color = VERDICT_COLORS[verdict] if verdict != kb.KEEP else "#6b7280"
+        for w in (self.badge, self.badge_icon, self.badge_text):
+            w.configure(background=color)
+        self.badge_icon.configure(text=W.ICONS[verdict])
+        self.badge_text.configure(text=text or verdict)
+        self.badge.pack(fill="x", before=self.details_frame)
+
+    def _write_details(self, chunks: list[tuple[str, str]], badge: str | None = None, badge_text: str = "") -> None:
+        self._set_badge(badge, badge_text)
         self.details.configure(state="normal")
         self.details.delete("1.0", "end")
         for text, tag in chunks:
@@ -268,7 +357,7 @@ class App(tk.Tk):
     def _show_welcome(self) -> None:
         chunks = [("Welcome to File Sorter\n", "title"),
                   ("1. Pick a folder or a whole drive at the top and press Scan.\n"
-                   "2. Every file gets a suggestion. Click the coloured boxes to filter.\n"
+                   "2. The Space map shows where your space goes. Click the coloured cards to list files.\n"
                    "3. Click any file to see what it is, what uses it and whether it's safe to remove.\n"
                    "4. Select files and use Move or Delete. Deleting goes to the Recycle Bin.\n", "")]
         for v in kb.VERDICTS:
@@ -286,7 +375,7 @@ class App(tk.Tk):
         if d:
             self.path_var.set(d)
 
-    def start_scan(self) -> None:
+    def start_scan(self, find_dupes: bool = False) -> None:
         if self.scan_thread and self.scan_thread.is_alive():
             return
         root = self.path_var.get().strip()
@@ -302,13 +391,12 @@ class App(tk.Tk):
             settings = Settings()
         self.cancel.clear()
         self.scan_btn.configure(state="disabled")
+        self.dupe_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.progress.start(12)
+        self._spin(True)
         self.status_var.set(f"Scanning {root} ...")
         self.folder_filter = None
         self.folder_chip.pack_forget()
-
-        find_dupes = bool(self.dupes_var.get())  # read Tk variables on the main thread only
 
         def work() -> None:
             def progress(n: int, b: int, folder: str) -> None:
@@ -352,8 +440,9 @@ class App(tk.Tk):
             self.after(100, self._poll)  # keep polling even if handling an event failed
 
     def _scan_stopped(self) -> None:
-        self.progress.stop()
+        self._spin(False)
         self.scan_btn.configure(state="normal")
+        self.dupe_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
 
     def _scan_finished(self, res: ScanResult) -> None:
@@ -367,13 +456,17 @@ class App(tk.Tk):
             f"{state}: {plural(len(res.files), 'file')} in {res.seconds:.0f}s. "
             f"You could free up to {human_size(removable)} by deleting and "
             f"{human_size(movable)} by moving." + (f"  ({res.errors:,} items couldn't be read)" if res.errors else ""))
+        self.map_folder = res.root
         self.refresh_all()
+        self.tabs.select(self.map_tab)
 
     # ------------------------------------------------------------------ lists
     def refresh_all(self) -> None:
+        self._index()
         self.refresh_cards()
         self.refresh_files()
         self.refresh_folders()
+        self.draw_map()
 
     def refresh_cards(self) -> None:
         if not self.result:
@@ -381,14 +474,21 @@ class App(tk.Tk):
         totals = self.result.totals()
         all_n = sum(v[0] for v in totals.values())
         all_b = sum(v[1] for v in totals.values())
-        for v, lbl in self.card_labels.items():
+        for v, (box, size, count) in self.card_widgets.items():
             n, b = (all_n, all_b) if v == ALL else totals[v]
-            mark = "> " if self.show_var.get() == v else ""
-            lbl.configure(text=f"{mark}{v}\n{plural(n, 'file')}  -  {human_size(b)}")
+            size.configure(text=human_size(b))
+            count.configure(text=plural(n, "file"))
+            chosen = self.show_var.get() == v
+            box.configure(highlightthickness=2 if chosen else 1,
+                          highlightbackground=W.COLORS.get(v, (W.TEXT,))[0] if chosen else W.BORDER)
+        self.storage_bar.set({v: totals[v][1] for v in kb.VERDICTS})
+        free, review, move = totals[kb.DELETE][1], totals[kb.REVIEW][1], totals[kb.MOVE][1]
+        self.headline.configure(text=f"You can free {human_size(free)} right away, {human_size(review)} more "
+                                     f"after a quick check, and move {human_size(move)} to another drive.")
 
     def set_filter(self, verdict: str) -> None:
         self.show_var.set(verdict)
-        self.tabs.select(0)
+        self.tabs.select(self.files_tab)
         self.refresh_cards()
         self.refresh_files()
 
@@ -417,6 +517,8 @@ class App(tk.Tk):
             elif show != ALL and f.verdict != show:
                 continue
             if prefix and not f.path.startswith(prefix):
+                continue
+            if self.folder_direct and os.path.dirname(f.path) != self.folder_filter:
                 continue
             if q and q not in f.path.lower():
                 continue
@@ -449,16 +551,17 @@ class App(tk.Tk):
             label = kb.SHORT[f.verdict] + (" (duplicate)" if f.duplicate_of else
                                            " (has copies)" if f.path in originals else "")
             self.tree.insert("", "end", iid=iid, tags=(f.verdict,),
-                             values=(f.name, human_size(f.size), label, f.assessment.kind_label,
+                             values=(f"{W.KIND_ICONS.get(f.assessment.kind, chr(0x2022))}   {f.name}",
+                                     human_size(f.size), f"{W.ICONS[f.verdict]}  {label}", f.assessment.kind_label,
                                      used, os.path.dirname(f.path)))
         if not items and self.show_var.get() == DUPES and self.result:
             self._write_details([("No duplicates found\n", "title"),
-                                 ("Make sure 'Find duplicate files' is ticked at the top, then press Scan again. "
+                                 ("To look for duplicates, press 'Scan + find duplicates' at the top. "
                                   "Only personal files of 1 MB or more (photos, videos, documents, archives...) "
                                   "are compared.\n", "")])
         total = sum(f.size for f in items)
         extra = f" (showing the first {MAX_ROWS:,})" if len(items) > MAX_ROWS else ""
-        self.tabs.tab(0, text=f"Files - {len(items):,} - {human_size(total)}{extra}")
+        self.tabs.tab(self.files_tab, text=f"  Files: {len(items):,} ({human_size(total)}){extra}  ")
 
     def sort_by(self, col: str) -> None:
         if self.sort_key == col:
@@ -491,6 +594,7 @@ class App(tk.Tk):
 
     def clear_folder_filter(self) -> None:
         self.folder_filter = None
+        self.folder_direct = False
         self.folder_chip.pack_forget()
         self.refresh_files()
 
@@ -498,13 +602,75 @@ class App(tk.Tk):
         sel = self.ftree.selection()
         if not sel:
             return
-        self.folder_filter = self.folder_rows[sel[0]]
+        self.show_folder_files(self.folder_rows[sel[0]])
+
+    def show_folder_files(self, folder: str, direct: bool = False) -> None:
+        self.folder_filter = folder
+        self.folder_direct = direct
         name = os.path.basename(self.folder_filter) or self.folder_filter
-        self.folder_chip.configure(text=f"Only in: {name}  x")
+        self.folder_chip.configure(text=f"Only in: {name}   \u2715")
         self.folder_chip.pack(side="left", padx=6)
         self.show_var.set(ALL)
-        self.tabs.select(0)
+        self.tabs.select(self.files_tab)
         self.refresh_files()
+
+    # ------------------------------------------------------------------ space map
+    def _index(self) -> None:
+        """Per-folder byte totals by verdict, and each folder's subfolders (for the space map)."""
+        self.by_dir, self.breakdown, self.subfolders = {}, {}, {}
+        if not self.result:
+            return
+        root = self.result.root
+        by_dir: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for f in self.result.files:
+            by_dir[os.path.dirname(f.path)][f.verdict] += f.size
+        breakdown: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        children: dict[str, set[str]] = defaultdict(set)
+        for d, vb in by_dir.items():
+            x = d
+            while True:
+                agg = breakdown[x]
+                for v, b in vb.items():
+                    agg[v] += b
+                if x == root or len(x) <= len(root):
+                    break
+                parent = os.path.dirname(x)
+                if parent == x:
+                    break
+                children[parent].add(x)
+                x = parent
+        self.by_dir, self.breakdown, self.subfolders = by_dir, breakdown, children
+
+    def draw_map(self) -> None:
+        if not self.result:
+            return
+        folder = self.map_folder or self.result.root
+        if folder not in self.breakdown:
+            folder = self.map_folder = self.result.root
+        items = [(os.path.basename(c) or c, c, dict(self.breakdown[c]), True) for c in self.subfolders.get(folder, ())]
+        if self.by_dir.get(folder):
+            items.append(("Files in this folder", folder, dict(self.by_dir[folder]), False))
+        self.space_map.show(items, "This folder is empty.")
+        total = sum(self.breakdown.get(folder, {}).values())
+        self.map_path.configure(text=f"{folder}   ({human_size(total)})")
+        self.up_btn.configure(state="normal" if folder != self.result.root else "disabled")
+
+    def map_open(self, path: str, is_folder: bool) -> None:
+        if is_folder and self.subfolders.get(path):
+            self.map_folder = path
+            self.draw_map()
+        else:  # a folder without subfolders, or the loose files of this folder: list them
+            self.show_var.set(ALL)
+            self.show_folder_files(path, direct=not is_folder)
+
+    def map_up(self) -> None:
+        if self.result and self.map_folder and self.map_folder != self.result.root:
+            self.map_folder = os.path.dirname(self.map_folder)
+            self.draw_map()
+
+    def _map_hover(self, text: str) -> None:
+        self.map_hint.configure(text=text or "Each box is a folder, sized by how much space it uses. "
+                                             "Colours show what's inside. Click a box to look inside it.")
 
     # ------------------------------------------------------------------ selection
     def selected_entries(self) -> list[FileEntry]:
@@ -550,8 +716,8 @@ class App(tk.Tk):
                 chunks.append((body + "\n", "mono"))
             else:
                 chunks.append((body + "\n", ""))
-        chunks.append(("\nNot sure? Press 'Ask Claude about this file' for an AI explanation.\n", "muted"))
-        self._write_details(chunks)
+        chunks.append(("\nNot sure? Press 'Ask Claude' for an AI explanation.\n", "muted"))
+        self._write_details(chunks, f.verdict, f.verdict + ("  (duplicate)" if f.duplicate_of else ""))
 
     def on_folder_select(self) -> None:
         sel = self.ftree.selection()
@@ -694,9 +860,9 @@ class App(tk.Tk):
     def _run_action(self, doing: str, work, verb: str) -> None:
         """Run a move/delete off the UI thread so the window never shows 'Not Responding'."""
         self.busy = True
-        for b in (self.btn_move, self.btn_delete, self.scan_btn):
+        for b in (self.btn_move, self.btn_delete, self.scan_btn, self.dupe_btn):
             b.configure(state="disabled")
-        self.progress.start(12)
+        self._spin(True)
 
         def progress(i: int, n: int, path: str) -> None:
             self.events.put(("status", f"{doing} {i + 1:,} of {n:,}: {os.path.basename(path)}"))
@@ -712,8 +878,9 @@ class App(tk.Tk):
 
     def _after_action(self, report: actions.ActionReport, verb: str) -> None:
         self.busy = False
-        self.progress.stop()
+        self._spin(False)
         self.scan_btn.configure(state="normal")
+        self.dupe_btn.configure(state="normal")
         done = {src for src, _ in report.done}
         if self.result:
             gone = [f for f in self.result.files if f.path in done]
@@ -755,7 +922,7 @@ class App(tk.Tk):
                 "(Anthropic's AI). The file's contents are NOT sent.\n\nContinue?"):
             return
         facts = self._facts_for_ai(f)
-        self.btn_ai.configure(state="disabled", text="Asking Claude...")
+        self.btn_ai.configure(state="disabled", text="Asking...")
 
         def work() -> None:
             try:
@@ -776,7 +943,7 @@ class App(tk.Tk):
         return "\n".join(lines)
 
     def _show_ai_answer(self, path: str, answer: str) -> None:
-        self.btn_ai.configure(text="Ask Claude about this file")
+        self.btn_ai.configure(text="Ask Claude")
         if self.current and self.current.path == path:
             self.btn_ai.configure(state="normal")
             self.details.configure(state="normal")
